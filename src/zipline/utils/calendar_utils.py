@@ -28,7 +28,7 @@ def wrap_with_signature(signature):
 @wrap_with_signature(inspect.signature(ec_get_calendar))
 def get_calendar(*args, **kwargs):
     if args[0] in ["us_futures", "CMES", "XNYS", "NYSE"]:
-        return ec_get_calendar(*args, side="right", start=pd.Timestamp("1990-01-01"))
+        return ec_get_calendar(*args, side="right", start=pd.Timestamp("1965-06-04"))
     return ec_get_calendar(*args, side="right")
 
 
