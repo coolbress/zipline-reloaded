@@ -64,7 +64,8 @@ dependencies = [
     #    'ta-lib >=0.4.09',
     'tables >=3.4.3',
     'toolz >=0.8.2',
-    'exchange-calendars >=4.2.4',
+    # 변경: 포크된 exchange-calendars 사용
+    'exchange-calendars @ git+https://github.com/coolbress/exchange_calendars.git@feature/custom-data-calendar'
 ]
 
 [project.urls]
