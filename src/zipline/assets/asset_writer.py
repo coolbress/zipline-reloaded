@@ -318,9 +318,17 @@ def _check_symbol_mappings(df, exchanges, asset_exchange):
             msg_component = "\n  ".join(str(data).splitlines())
             ambiguous[persymbol.name] = intersections, msg_component
 
-    mappings.groupby(["symbol", "country_code"], group_keys=False).apply(
-        check_intersections
-    )
+    # Pandas >= 2.3 deprecates including grouping columns in apply; pass
+    # include_groups=False when available to avoid FutureWarning while keeping
+    # compatibility with older versions where the argument is not supported.
+    try:
+        mappings.groupby(["symbol", "country_code"], group_keys=False).apply(
+            check_intersections, include_groups=False
+        )
+    except TypeError:
+        mappings.groupby(["symbol", "country_code"], group_keys=False).apply(
+            check_intersections
+        )
 
     if ambiguous:
         raise ValueError(
@@ -380,7 +388,14 @@ def _split_symbol_mappings(df, exchanges):
 
     _check_symbol_mappings(mappings, exchanges, asset_exchange)
     return (
-        df.groupby(level=0, group_keys=False).apply(_check_asset_group),
+        # See note above regarding include_groups for pandas >= 2.3.
+        (
+            df.groupby(level=0, group_keys=False).apply(
+                _check_asset_group, include_groups=False
+            )
+            if "include_groups" in pd.core.groupby.generic.DataFrameGroupBy.apply.__code__.co_varnames
+            else df.groupby(level=0, group_keys=False).apply(_check_asset_group)
+        ),
         mappings,
     )
 
