@@ -28,10 +28,7 @@ classifiers = [
     'Topic :: System :: Distributed Computing',
 ]
 
-license = "Apache-2.0"
-license-files = [
-    "LICENSE",
-]
+license = { text = "Apache-2.0" }
 
 requires-python = '>=3.10'
 dependencies = [
@@ -64,6 +61,7 @@ dependencies = [
     #    'ta-lib >=0.4.09',
     'tables >=3.4.3',
     'toolz >=0.8.2',
+    'tqdm >=4.64.0',
     # 변경: 포크된 exchange-calendars 사용
     'exchange-calendars @ git+https://github.com/coolbress/exchange_calendars.git@feature/custom-data-calendar'
 ]
