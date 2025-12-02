@@ -434,7 +434,6 @@ def _make_bundle_core():
                 # when we create the SQLiteAdjustmentWriter below. The
                 # SQLiteAdjustmentWriter needs to open the daily ctables so
                 # that it can compute the adjustment ratios for the dividends.
-
                 daily_bar_writer.write(())
                 minute_bar_writer = BcolzMinuteBarWriter(
                     wd.ensure_dir(*minute_equity_relative(name, timestr)),
@@ -553,6 +552,10 @@ def _make_bundle_core():
         if timestamp is None:
             timestamp = pd.Timestamp.utcnow()
         timestr = most_recent_data(name, timestamp, environ=environ)
+        
+        daily_bars_path = daily_equity_path(name, timestr, environ=environ)
+        daily_bar_reader = BcolzDailyBarReader(daily_bars_path)
+        
         return BundleData(
             asset_finder=AssetFinder(
                 asset_db_path(name, timestr, environ=environ),
@@ -560,9 +563,7 @@ def _make_bundle_core():
             equity_minute_bar_reader=BcolzMinuteBarReader(
                 minute_equity_path(name, timestr, environ=environ),
             ),
-            equity_daily_bar_reader=BcolzDailyBarReader(
-                daily_equity_path(name, timestr, environ=environ),
-            ),
+            equity_daily_bar_reader=daily_bar_reader,
             adjustment_reader=SQLiteAdjustmentReader(
                 adjustment_db_path(name, timestr, environ=environ),
             ),
@@ -650,7 +651,11 @@ def _make_bundle_core():
 
         return cleaned
 
-    return BundleCore(bundles, register, unregister, ingest, load, clean)
+    # Export most_recent_data as module-level function
+    most_recent_data_func = most_recent_data
+    
+    return BundleCore(bundles, register, unregister, ingest, load, clean), most_recent_data_func
 
 
-bundles, register, unregister, ingest, load, clean = _make_bundle_core()
+_bundle_core, most_recent_data = _make_bundle_core()
+bundles, register, unregister, ingest, load, clean = _bundle_core
