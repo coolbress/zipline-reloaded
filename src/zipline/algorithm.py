@@ -15,12 +15,14 @@
 from collections.abc import Iterable
 from collections import namedtuple
 from copy import copy
+import sys
 import warnings
 from datetime import tzinfo, time, timezone
 import logging
 import pytz
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
 
 from itertools import chain, repeat
 
@@ -620,22 +622,119 @@ class TradingAlgorithm:
                 self.asset_finder is not None
             ), "Have data portal without asset_finder."
 
+        # Calculate total trading days for progress bar
+        sessions = self.trading_calendar.sessions_in_range(
+            self.sim_params.start_session,
+            self.sim_params.end_session
+        )
+        total_days = len(sessions)
+        
+        # Create progress bar
+        progress_bar = self._create_progress_bar(total_days)
+        last_date = None
+        daily_stats = None
+        
+        # Track execution time
+        import time as time_module
+        start_time = time_module.time()
+
         # Create zipline and loop through simulated_trading.
         # Each iteration returns a perf dictionary
         try:
             perfs = []
             for perf in self.get_generator():
                 perfs.append(perf)
+                
+                # Update progress bar when a new trading day is processed
+                if progress_bar and "daily_perf" in perf:
+                    perf_date = perf["daily_perf"].get("period_close")
+                    if perf_date and perf_date != last_date:
+                        progress_bar.update(1)
+                        progress_bar.set_description(
+                            f"Backtesting: {perf_date.date()}"
+                        )
+                        last_date = perf_date
 
             # convert perf dict to pandas dataframe
             daily_stats = self._create_daily_stats(perfs)
 
             self.analyze(daily_stats)
         finally:
+            if progress_bar:
+                progress_bar.close()
+                # Print completion message with execution time
+                if daily_stats is not None and len(daily_stats) > 0:
+                    exec_time = time_module.time() - start_time
+                    time_str = self._format_execution_time(exec_time)
+                    print(f"Backtest Execution Time: {time_str}")
             self.data_portal = None
             self.metrics_tracker = None
 
         return daily_stats
+
+    def _create_progress_bar(self, total_days):
+        """Create a progress bar for backtest execution.
+        
+        Parameters
+        ----------
+        total_days : int
+            Total number of trading days in the backtest period.
+            
+        Returns
+        -------
+        tqdm.tqdm
+            Progress bar instance.
+        """
+        return tqdm(
+            total=total_days,
+            desc="Backtesting",
+            unit="day",
+            bar_format='{l_bar}{bar}| {n}/{total} days [{elapsed}<{remaining}]',
+            file=sys.stdout,
+            ncols=100,
+        )
+
+    @staticmethod
+    def _format_execution_time(total_seconds):
+        """Format execution time in a human-readable format.
+        
+        Parameters
+        ----------
+        total_seconds : float
+            Number of seconds elapsed.
+            
+        Returns
+        -------
+        formatted : str
+            User-facing text representation of elapsed time.
+            Format matches Pipeline execution time format.
+        """
+        def maybe_s(n):
+            if n == 1:
+                return ""
+            return "s"
+
+        minutes, seconds = divmod(total_seconds, 60)
+        minutes = int(minutes)
+        if minutes >= 60:
+            hours, minutes = divmod(minutes, 60)
+            t = "{hours} Hour{hs}, {minutes} Minute{ms}, {seconds:.2f} Seconds"
+            return t.format(
+                hours=hours,
+                hs=maybe_s(hours),
+                minutes=minutes,
+                ms=maybe_s(minutes),
+                seconds=seconds,
+            )
+        elif minutes >= 1:
+            t = "{minutes} Minute{ms}, {seconds:.2f} Seconds"
+            return t.format(
+                minutes=minutes,
+                ms=maybe_s(minutes),
+                seconds=seconds,
+            )
+        else:
+            return "{seconds:.2f} Seconds".format(seconds=seconds)
 
     def _create_daily_stats(self, perfs):
         # create daily and cumulative stats dataframe
