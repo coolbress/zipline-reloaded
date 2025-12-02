@@ -149,7 +149,8 @@ cpdef _read_bcolz_data(ctable_t table,
                        intp_t[:] first_rows,
                        intp_t[:] last_rows,
                        intp_t[:] offsets,
-                       bool read_all):
+                       bool read_all,
+                       set no_scale_columns=None):
     """Load raw bcolz data for the given columns and indices.
 
     Parameters
@@ -160,7 +161,6 @@ cpdef _read_bcolz_data(ctable_t table,
         The shape of the expected output arrays.
     columns : list[str]
         List of column names to read.
-
     first_rows : ndarray[intp]
     last_rows : ndarray[intp]
     offsets : ndarray[intp
@@ -168,11 +168,19 @@ cpdef _read_bcolz_data(ctable_t table,
     read_all : bool
         Whether to read_all sid data at once, or to read a silce from the
         carray for each sid.
+    no_scale_columns : set[str], optional
+        Set of column names that should NOT be scaled by 0.001.
+        Defaults to {'volume', 'day', 'id'} (columns that don't need scaling).
+        All other columns (OHLCV prices and numeric features) are automatically
+        scaled by 0.001 to restore decimal precision.
 
     Returns
     -------
     results : list of ndarray
         A 2D array of shape `shape` for each column in `columns`.
+        Numeric columns (OHLCV prices and numeric features) are returned as
+        float64 arrays scaled by 0.001. Other columns (volume, day, id, categorical)
+        are returned as uint32 arrays.
     """
     cdef:
         int nassets
@@ -189,6 +197,13 @@ cpdef _read_bcolz_data(ctable_t table,
         intp_t last_row
         intp_t offset
         list results = []
+        set no_scale_cols
+
+    # Default no_scale_columns to volume, day, id (columns that don't need scaling)
+    if no_scale_columns is None:
+        no_scale_cols = {'volume', 'day', 'id'}
+    else:
+        no_scale_cols = no_scale_columns | {'day', 'id'}
 
     ndays = shape[0]
     nassets = shape[1]
@@ -233,11 +248,72 @@ cpdef _read_bcolz_data(ctable_t table,
                 else:
                     continue
 
-        if column_name in {'open', 'high', 'low', 'close'}:
+        if column_name not in no_scale_cols:
+            # Scale by 0.001 to restore decimal precision
+            # Applies to all numeric columns: OHLCV prices and numeric features
+            # (all use * 1000 scaling during write, so * 0.001 here)
             where_nan = (outbuf == 0)
             outbuf_as_float = outbuf.astype(float64) * .001
             outbuf_as_float[where_nan] = NAN
             results.append(outbuf_as_float)
         else:
+            # Return as-is for volume, day, id, and categorical features
+            # (volume/day/id don't need scaling, categorical will be decoded in Python)
             results.append(outbuf)
     return results
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef _decode_categorical_features(ndarray[dtype=uint32_t, ndim=2] uint32_data,
+                                   dict decoding_map):
+    """Decode categorical features from uint32 to string/object arrays.
+    
+    Parameters
+    ----------
+    uint32_data : ndarray[uint32, ndim=2]
+        2D array of shape (n_dates, n_assets) containing encoded categorical values.
+    decoding_map : dict[int, str or None]
+        Dictionary mapping uint32 encoded values to their string representations.
+        Key 0 is reserved for NaN/None.
+    
+    Returns
+    -------
+    decoded_array : ndarray[object, ndim=2]
+        2D array of shape (n_dates, n_assets) containing decoded string values.
+        Missing values (0) are set to None.
+    """
+    cdef:
+        intp_t n_dates = uint32_data.shape[0]
+        intp_t n_assets = uint32_data.shape[1]
+        intp_t row_idx, asset_idx
+        uint32_t uint32_val
+        object decoded_val
+        ndarray[dtype=object, ndim=2] decoded_array
+    
+    # Create object array initialized with None
+    decoded_array = full((n_dates, n_assets), None, dtype=object)
+    
+    # Decode each value using the decoding map
+    # Note: decoding_map[0] = None is intentional (missing value marker)
+    # If decoding_map doesn't contain a value, it means the data is corrupted
+    # or the encoding/decoding maps are out of sync. We treat such values as missing (None).
+    for row_idx in range(n_dates):
+        for asset_idx in range(n_assets):
+            uint32_val = uint32_data[row_idx, asset_idx]
+            if uint32_val != 0:
+                # Look up in decoding map
+                # If key doesn't exist, treat as missing (None)
+                decoded_val = decoding_map.get(uint32_val)
+                decoded_array[row_idx, asset_idx] = decoded_val
+            # else: leave as None (already initialized) - missing value (0 -> None via decoding_map[0])
+            # Note: decoding_map[0] = None, so 0 values will decode to None
+    
+    # Convert None to empty string: pandas Categorical doesn't allow None in categories.
+    # Empty string is used as missing_value for LabelArray compatibility.
+    for row_idx in range(n_dates):
+        for asset_idx in range(n_assets):
+            if decoded_array[row_idx, asset_idx] is None:
+                decoded_array[row_idx, asset_idx] = ''
+    
+    return decoded_array
