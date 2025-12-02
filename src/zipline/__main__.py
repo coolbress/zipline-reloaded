@@ -465,5 +465,423 @@ def bundles():
             click.echo("%s %s" % (bundle, timestamp))
 
 
+@main.command()
+@click.option(
+    "-b",
+    "--bundle",
+    default=DEFAULT_BUNDLE,
+    metavar="BUNDLE-NAME",
+    show_default=True,
+    help="The data bundle to update.",
+)
+@click.option(
+    "-t",
+    "--timestamp",
+    type=Timestamp(),
+    default=None,
+    help="Timestamp of the bundle ingestion to update. If not provided, uses most recent.",
+)
+@click.option(
+    "-f",
+    "--file",
+    "data_file",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to data file (CSV, Parquet, or HDF5) containing new data.",
+)
+@click.option(
+    "--format",
+    "data_format",
+    type=click.Choice(["csv", "parquet", "hdf5"]),
+    default="parquet",
+    help="Format of the data file.",
+)
+@click.option(
+    "--symbol-column",
+    default="symbol",
+    help="Column name for symbol identifiers (for CSV/Parquet).",
+)
+def update_bundle(bundle, timestamp, data_file, data_format, symbol_column):
+    """Update existing V2 bundle with new data (incremental update).
+    
+    This command adds new data to an existing V2 bundle without re-ingesting
+    the entire dataset. Only works with V2 bundles (created with use_v2_writer=True).
+    
+    Examples:
+        # Update with Parquet file
+        zipline update-bundle -b my_bundle_v2 -f new_data.parquet
+        
+        # Update with CSV file
+        zipline update-bundle -b my_bundle_v2 -f new_data.csv --format csv
+        
+        # Update specific timestamp
+        zipline update-bundle -b my_bundle_v2 -f new_data.parquet -t 2024-01-01
+    """
+    try:
+        from zipline.data.bcolz_daily_bars import BcolzDailyBarWriter
+        from zipline.data.bundles.parquetdir import _parquet_pricing_iter
+        from zipline.data.bundles.hdfdir import _hdf5_pricing_iter
+        import polars as pl
+    except ImportError as e:
+        click.echo(f"Error: V2 Writer not available: {e}", err=True)
+        raise click.Abort()
+    
+    # Get bundle path
+    if timestamp is None:
+        timestamp = pd.Timestamp.utcnow()
+    
+    try:
+        timestr = bundles_module.most_recent_data(bundle, timestamp, environ=os.environ)
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort()
+    
+    daily_bars_path = bundles_module.daily_equity_path(
+        bundle, timestr, environ=os.environ
+    )
+    
+    # V2 bundle: check if path is a directory (V2) or file (V1)
+    if os.path.isdir(daily_bars_path):
+        # V2 bundle: metadata.json is in the directory
+        metadata_path = os.path.join(daily_bars_path, "metadata.json")
+    else:
+        # V1 bundle: not supported for updates
+        click.echo(
+            f"Error: Bundle '{bundle}' is not a V2 bundle. "
+            f"V2 bundles require use_v2_writer=True during ingest. "
+            f"Found path: {daily_bars_path}",
+            err=True
+        )
+        raise click.Abort()
+    
+    if not os.path.exists(metadata_path):
+        click.echo(
+            f"Error: V2 bundle metadata not found at {metadata_path}",
+            err=True
+        )
+        raise click.Abort()
+    
+    # Open bundle for writing
+    try:
+        from zipline.assets import AssetFinder
+        writer = BcolzDailyBarWriter.open(daily_bars_path)
+        asset_finder = AssetFinder(
+            bundles_module.asset_db_path(bundle, timestr, environ=os.environ)
+        )
+    except Exception as e:
+        click.echo(f"Error opening bundle: {e}", err=True)
+        raise click.Abort()
+    
+    click.echo(f"Updating bundle '{bundle}' at {daily_bars_path}")
+    
+    # Read and process data based on format
+    if data_format == "parquet":
+        try:
+            df_all = pl.read_parquet(data_file).to_pandas()
+            symbols = sorted(df_all[symbol_column].unique())
+            
+            # Get symbol to sid mapping
+            all_assets = asset_finder.retrieve_all(asset_finder.sids)
+            symbol_to_sid = {asset.symbol: asset.sid for asset in all_assets}
+            
+            for symbol in symbols:
+                if symbol not in symbol_to_sid:
+                    click.echo(f"  Warning: Symbol '{symbol}' not found in bundle, skipping", err=True)
+                    continue
+                
+                sid = symbol_to_sid[symbol]
+                df_symbol = df_all[df_all[symbol_column] == symbol].copy()
+                if df_symbol.empty:
+                    continue
+                
+                # Prepare DataFrame with OHLCV
+                datetime_col = df_symbol.index.name if isinstance(df_symbol.index, pd.DatetimeIndex) else df_symbol.columns[0]
+                if datetime_col not in df_symbol.index.names and datetime_col not in df_symbol.columns:
+                    datetime_col = df_symbol.columns[0]
+                
+                if datetime_col in df_symbol.columns:
+                    df_symbol = df_symbol.set_index(datetime_col)
+                
+                df_symbol = df_symbol[['open', 'high', 'low', 'close', 'volume']].copy()
+                df_symbol.index = pd.to_datetime(df_symbol.index).tz_localize(None)
+                df_symbol = df_symbol.sort_index()
+                
+                try:
+                    writer.append_sid(sid, df_symbol, allow_overlap=True)
+                    click.echo(f"  ✓ Updated sid={sid} ({symbol}): {len(df_symbol)} days")
+                except Exception as e:
+                    click.echo(f"  ✗ Failed to update sid={sid} ({symbol}): {e}", err=True)
+        
+        except Exception as e:
+            click.echo(f"Error processing Parquet file: {e}", err=True)
+            raise click.Abort()
+    
+    elif data_format == "csv":
+        click.echo("CSV format update not yet implemented. Please use Parquet format.")
+        raise click.Abort()
+    
+    elif data_format == "hdf5":
+        click.echo("HDF5 format update not yet implemented. Please use Parquet format.")
+        raise click.Abort()
+    
+    click.echo(f"✓ Bundle update completed!")
+
+
+@main.command()
+@click.option(
+    "-b",
+    "--bundle",
+    default=DEFAULT_BUNDLE,
+    metavar="BUNDLE-NAME",
+    show_default=True,
+    help="The data bundle to add feature to.",
+)
+@click.option(
+    "-t",
+    "--timestamp",
+    type=Timestamp(),
+    default=None,
+    help="Timestamp of the bundle ingestion. If not provided, uses most recent.",
+)
+@click.option(
+    "-f",
+    "--file",
+    "feature_file",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to feature data file (CSV, Parquet, or HDF5). Expected format: date x sid wide format (CSV/Parquet) or HDF5 with symbol groups.",
+)
+@click.option(
+    "--feature-name",
+    default=None,
+    help="Name of the feature to add (e.g., 'pe', 'pbr', 'market_cap'). Required for CSV/Parquet, optional for HDF5 (auto-detect all features).",
+)
+@click.option(
+    "--format",
+    "data_format",
+    type=click.Choice(["csv", "parquet", "hdf5"]),
+    default=None,
+    help="Format of the feature data file. If not specified, auto-detect from file extension.",
+)
+@click.option(
+    "--dtype",
+    default="float64",
+    type=click.Choice(["float64", "float32", "int64", "int32", "uint32", "uint64"]),
+    help="Data type for feature storage.",
+)
+@click.option(
+    "--scaling-factor",
+    default=1.0,
+    type=float,
+    help="Scaling factor for feature storage (e.g., 1000 for prices).",
+)
+@click.option(
+    "--symbol-column",
+    default="symbol",
+    help="Column name for symbol identifiers (for mapping to sids).",
+)
+def add_feature(
+    bundle, timestamp, feature_file, feature_name, data_format,
+    dtype, scaling_factor, symbol_column
+):
+    """Add a custom feature to an existing V2 bundle.
+    
+    This command adds a feature column to all assets in a V2 bundle.
+    
+    For CSV/Parquet: The feature data file should be in wide format (date x sid/symbol).
+    For HDF5: The file should have the same structure as OHLCV HDF5 file, with feature
+    datasets in each symbol group. All features in the file will be automatically detected
+    and added (OHLCV and corporate actions are excluded).
+    
+    Examples:
+        # Add PE ratio feature from Parquet file
+        zipline add-feature -b my_bundle_v2 -f pe_data.parquet --feature-name pe
+        
+        # Add feature with custom dtype and scaling
+        zipline add-feature -b my_bundle_v2 -f market_cap.parquet \\
+            --feature-name market_cap --dtype float32 --scaling-factor 1000
+        
+        # Add all features from HDF5 file (auto-detect)
+        zipline add-feature -b my_bundle_v2 -f features.h5 --format hdf5
+    """
+    try:
+        from zipline.data.bcolz_daily_bars import BcolzDailyBarWriter, BcolzDailyBarReader
+        from zipline.assets import AssetFinder
+        import polars as pl
+    except ImportError as e:
+        click.echo(f"Error: V2 Writer not available: {e}", err=True)
+        raise click.Abort()
+    
+    # Get bundle path
+    if timestamp is None:
+        timestamp = pd.Timestamp.utcnow()
+    
+    try:
+        timestr = bundles_module.most_recent_data(bundle, timestamp, environ=os.environ)
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort()
+    
+    daily_bars_path = bundles_module.daily_equity_path(
+        bundle, timestr, environ=os.environ
+    )
+    
+    # V2 bundle: check if path is a directory (V2) or file (V1)
+    if os.path.isdir(daily_bars_path):
+        # V2 bundle: metadata.json is in the directory
+        metadata_path = os.path.join(daily_bars_path, "metadata.json")
+    else:
+        # V1 bundle: not supported for feature addition
+        click.echo(
+            f"Error: Bundle '{bundle}' is not a V2 bundle. "
+            f"V2 bundles require use_v2_writer=True during ingest. "
+            f"Found path: {daily_bars_path}",
+            err=True
+        )
+        raise click.Abort()
+    
+    if not os.path.exists(metadata_path):
+        click.echo(
+            f"Error: V2 bundle metadata not found at {metadata_path}",
+            err=True
+        )
+        raise click.Abort()
+    
+    # Open bundle
+    try:
+        writer = BcolzDailyBarWriter.open(daily_bars_path)
+        reader = BcolzDailyBarReader(daily_bars_path)
+        asset_finder = AssetFinder(
+            bundles_module.asset_db_path(bundle, timestr, environ=os.environ)
+        )
+    except Exception as e:
+        click.echo(f"Error opening bundle: {e}", err=True)
+        raise click.Abort()
+    
+    # Auto-detect format if not specified
+    if data_format is None:
+        if feature_file.endswith('.h5') or feature_file.endswith('.hdf5'):
+            data_format = 'hdf5'
+        elif feature_file.endswith('.parquet'):
+            data_format = 'parquet'
+        elif feature_file.endswith('.csv'):
+            data_format = 'csv'
+        else:
+            click.echo(f"Error: Cannot auto-detect format for {feature_file}. Please specify --format", err=True)
+            raise click.Abort()
+    
+    # Validate feature_name for CSV/Parquet
+    if data_format in ['csv', 'parquet'] and not feature_name:
+        click.echo(f"Error: --feature-name is required for {data_format} format", err=True)
+        raise click.Abort()
+    
+    # Get symbol to sid mapping
+    all_assets = asset_finder.retrieve_all(asset_finder.sids)
+    symbol_to_sid = {asset.symbol: asset.sid for asset in all_assets}
+    
+    click.echo(f"  Found {len(symbol_to_sid)} assets in bundle")
+    
+    # Process based on format
+    if data_format == "hdf5":
+        # HDF5 format: extract all features automatically
+        try:
+            import h5py
+            from zipline.data.bundles.hdfdir import _extract_features_from_hdf5
+            
+            # Create metadata DataFrame from asset_finder for symbol mapping
+            metadata = pd.DataFrame({
+                'symbol': [asset.symbol for asset in all_assets],
+            })
+            metadata.index = [asset.sid for asset in all_assets]
+            
+            # Get symbols from HDF5 file
+            with h5py.File(feature_file, 'r') as hdf:
+                hdf_symbols = sorted(hdf.keys())
+                
+                click.echo(f"Adding features from HDF5 file: {feature_file}")
+                click.echo(f"  Found {len(hdf_symbols)} symbols in HDF5 file")
+                
+                # Extract and add all features
+                _extract_features_from_hdf5(
+                    hdf,
+                    writer,
+                    hdf_symbols,
+                    metadata,
+                    show_progress=True
+                )
+        
+        except Exception as e:
+            click.echo(f"Error processing HDF5 file: {e}", err=True)
+            raise click.Abort()
+    
+    elif data_format in ["parquet", "csv"]:
+        # CSV/Parquet format: single feature
+        if not feature_name:
+            click.echo(f"Error: --feature-name is required for {data_format} format", err=True)
+            raise click.Abort()
+        
+        click.echo(f"Adding feature '{feature_name}' to bundle '{bundle}'")
+        
+        try:
+            if data_format == "parquet":
+                df = pl.read_parquet(feature_file).to_pandas()
+            elif data_format == "csv":
+                df = pd.read_csv(feature_file, index_col=0, parse_dates=True)
+            
+            # Ensure index is DatetimeIndex
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.index = pd.to_datetime(df.index)
+            df.index = df.index.tz_localize(None)
+            
+            click.echo(f"  Feature data shape: {df.shape}")
+            
+            # Add feature to each asset
+            added_count = 0
+            for symbol, sid in symbol_to_sid.items():
+                if symbol not in df.columns:
+                    continue
+                
+                try:
+                    # Get feature values for this asset
+                    feature_series = df[symbol].dropna()
+                    if len(feature_series) == 0:
+                        continue
+                    
+                    # Get asset's OHLCV data to match dates
+                    asset_df = reader.read_sid_df(sid)
+                    if asset_df.empty:
+                        continue
+                    
+                    # Align feature data with asset dates
+                    feature_series = feature_series.reindex(asset_df.index, method='ffill')
+                    
+                    # Add feature
+                    writer.add_feature(
+                        sid,
+                        feature_name,
+                        feature_series,
+                        dtype=dtype,
+                        scaling_factor=scaling_factor,
+                    )
+                    added_count += 1
+                    click.echo(f"  ✓ Added '{feature_name}' to sid={sid} ({symbol})")
+                
+                except Exception as e:
+                    click.echo(
+                        f"  ✗ Failed to add '{feature_name}' to sid={sid} ({symbol}): {e}",
+                        err=True
+                    )
+            
+            click.echo(f"✓ Feature '{feature_name}' added to {added_count} assets!")
+        
+        except Exception as e:
+            click.echo(f"Error processing feature data: {e}", err=True)
+            raise click.Abort()
+    
+    else:
+        click.echo(f"Error: Unsupported format: {data_format}", err=True)
+        raise click.Abort()
+
+
 if __name__ == "__main__":
     main()
