@@ -1,6 +1,7 @@
 """Pipeline hooks for tracking and displaying progress."""
 
 from collections import namedtuple
+import sys
 import time
 
 
@@ -8,6 +9,7 @@ from zipline.utils.compat import contextmanager, escape_html
 from zipline.utils.string_formatting import bulleted_list
 
 from .iface import PipelineHooks
+from tqdm import tqdm
 
 
 class ProgressHooks(PipelineHooks):
@@ -43,6 +45,18 @@ class ProgressHooks(PipelineHooks):
     def with_static_publisher(cls, publisher):
         """Construct a ProgressHooks that uses an already-constructed publisher."""
         return cls(publisher_factory=lambda: publisher)
+    
+    @classmethod
+    def with_terminal_publisher(cls):
+        """
+        Construct a ProgressHooks that publishes to terminal using tqdm.
+        
+        Returns
+        -------
+        ProgressHooks
+            A ProgressHooks instance that displays progress in the terminal.
+        """
+        return cls(publisher_factory=TerminalProgressPublisher)
 
     def _publish(self):
         self._publisher.publish(self._model)
@@ -453,6 +467,86 @@ class IPythonWidgetProgressPublisher:
             )
         else:
             return "{seconds:.2f} Seconds".format(seconds=seconds)
+
+
+class TerminalProgressPublisher:
+    """A progress publisher that displays progress in terminal using tqdm."""
+    
+    def __init__(self):
+        self._pbar = None
+        self._last_percent = 0.0
+        self._current_desc = "Pipeline"
+    
+    def publish(self, model):
+        if model.state == "init":
+            # Initialize progress bar
+            self._pbar = tqdm(
+                total=100.0,
+                desc=self._current_desc,
+                unit="%",
+                bar_format='{l_bar}{bar}| {n:.1f}% [{elapsed}<{remaining}]',
+                file=sys.stdout,
+                ncols=100,
+            )
+            self._last_percent = 0.0
+        
+        elif model.state in ("loading", "computing"):
+            # Update progress bar
+            percent = model.percent_complete
+            increment = percent - self._last_percent
+            
+            if model.state == "loading":
+                n_terms = len(model.current_work) if model.current_work else 0
+                desc = f"Loading {n_terms} term{'s' if n_terms != 1 else ''}"
+            else:
+                # Show current term being computed
+                if model.current_work:
+                    term_str = str(model.current_work[0])
+                    # Truncate long term names
+                    if len(term_str) > 50:
+                        term_str = term_str[:47] + "..."
+                    desc = f"Computing {term_str}"
+                else:
+                    desc = "Computing"
+            
+            if desc != self._current_desc:
+                self._pbar.set_description(desc)
+                self._current_desc = desc
+            
+            if increment > 0:
+                self._pbar.update(increment)
+                self._last_percent = percent
+        
+        elif model.state == "success":
+            # Complete progress bar
+            self._pbar.set_description("Pipeline: Complete")
+            remaining = 100.0 - self._last_percent
+            if remaining > 0:
+                self._pbar.update(remaining)
+            self._pbar.close()
+            
+            # Print execution time
+            exec_time = model.execution_time
+            if exec_time < 60:
+                time_str = f"{exec_time:.2f}s"
+            elif exec_time < 3600:
+                minutes = int(exec_time // 60)
+                seconds = exec_time % 60
+                time_str = f"{minutes}m {seconds:.2f}s"
+            else:
+                hours = int(exec_time // 3600)
+                minutes = int((exec_time % 3600) // 60)
+                seconds = exec_time % 60
+                time_str = f"{hours}h {minutes}m {seconds:.2f}s"
+            
+            print(f"✅ Pipeline execution completed in {time_str}")
+        
+        elif model.state == "error":
+            # Error state
+            if self._pbar:
+                self._pbar.set_description("Pipeline: Error")
+                self._pbar.close()
+            print("❌ Pipeline execution failed")
 
 
 class TestingProgressPublisher:
