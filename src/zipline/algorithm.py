@@ -207,6 +207,9 @@ class TradingAlgorithm:
         default: 'zipline'
     adjustment_reader : AdjustmentReader
         The interface to the adjustments.
+    show_progress : bool, optional
+        Whether to display a progress bar during backtest execution.
+        Default is True.
     """
 
     def __init__(
@@ -234,6 +237,7 @@ class TradingAlgorithm:
         capital_changes=None,
         get_pipeline_loader=None,
         create_event_context=None,
+        show_progress=True,
         **initialize_kwargs,
     ):
         # List of trading controls to be used to validate orders.
@@ -246,6 +250,7 @@ class TradingAlgorithm:
         self.namespace = namespace or {}
 
         self._platform = platform
+        self._show_progress = show_progress
         self.logger = None
 
         # XXX: This is kind of a mess.
@@ -623,14 +628,16 @@ class TradingAlgorithm:
             ), "Have data portal without asset_finder."
 
         # Calculate total trading days for progress bar
-        sessions = self.trading_calendar.sessions_in_range(
-            self.sim_params.start_session,
-            self.sim_params.end_session
-        )
-        total_days = len(sessions)
-        
-        # Create progress bar
-        progress_bar = self._create_progress_bar(total_days)
+        progress_bar = None
+        if self._show_progress:
+            sessions = self.trading_calendar.sessions_in_range(
+                self.sim_params.start_session,
+                self.sim_params.end_session
+            )
+            total_days = len(sessions)
+            
+            # Create progress bar
+            progress_bar = self._create_progress_bar(total_days)
         last_date = None
         daily_stats = None
         

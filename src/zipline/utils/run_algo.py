@@ -84,6 +84,7 @@ def _run(
     blotter,
     custom_loader,
     benchmark_spec,
+    show_progress=True,
 ):
     """Run a backtest for the given algorithm.
 
@@ -213,6 +214,7 @@ def _run(
             blotter=blotter,
             benchmark_returns=benchmark_returns,
             benchmark_sid=benchmark_sid,
+            show_progress=show_progress,
             **(
                 {
                     "initialize": initialize,
@@ -321,6 +323,7 @@ def run_algorithm(
     environ=os.environ,
     custom_loader=None,
     blotter="default",
+    show_progress=True,
 ):
     """
     Run a trading algorithm.
@@ -382,6 +385,9 @@ def run_algorithm(
         ``zipline.extensions.register`` and call it with no parameters.
         Default is a :class:`zipline.finance.blotter.SimulationBlotter` that
         never cancels orders.
+    show_progress : bool, optional
+        Whether to display a progress bar during backtest execution.
+        Default is True.
 
     Returns
     -------
@@ -419,6 +425,7 @@ def run_algorithm(
         blotter=blotter,
         custom_loader=custom_loader,
         benchmark_spec=benchmark_spec,
+        show_progress=show_progress,
     )
 
 
