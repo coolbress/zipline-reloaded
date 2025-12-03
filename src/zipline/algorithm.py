@@ -632,11 +632,12 @@ class TradingAlgorithm:
         if self._show_progress:
             sessions = self.trading_calendar.sessions_in_range(
                 self.sim_params.start_session,
-                self.sim_params.end_session
+                self.sim_params.end_session,
             )
             total_days = len(sessions)
-            
-            # Create progress bar
+
+            # Create progress bar (single bar updated in-place)
+            # Description is static to avoid creating visually "new" bars per day.
             progress_bar = self._create_progress_bar(total_days)
         last_date = None
         daily_stats = None
@@ -651,15 +652,15 @@ class TradingAlgorithm:
             perfs = []
             for perf in self.get_generator():
                 perfs.append(perf)
-                
-                # Update progress bar when a new trading day is processed
+
+                # Update progress bar when a new trading day is processed.
+                # We keep a single tqdm bar and only advance its counter.
+                # The description is static ("Backtesting") to prevent
+                # multiple bars being visually printed for each date.
                 if progress_bar and "daily_perf" in perf:
                     perf_date = perf["daily_perf"].get("period_close")
                     if perf_date and perf_date != last_date:
                         progress_bar.update(1)
-                        progress_bar.set_description(
-                            f"Backtesting: {perf_date.date()}"
-                        )
                         last_date = perf_date
 
             # convert perf dict to pandas dataframe
