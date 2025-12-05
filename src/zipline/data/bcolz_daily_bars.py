@@ -1366,9 +1366,19 @@ class BcolzDailyBarReader(CurrencyAwareSessionBarReader):
                 # Categorical: decode integer back to string
                 return None if value == 0 else decoding_map.get(int(value), None)
             else:
-                # Numeric: Always use OHLCV-like inverse scaling (* 0.001)
-                # No need to check scaling_factor - all numeric features use * 1000 during write
-                value = float(value) * 0.001
+                # Numeric: Apply inverse scaling and offset removal
+                scale_with_thousand = feature_meta.get('scale_with_thousand', True)
+                negative_offset = float(feature_meta.get('negative_offset', 0.0) or 0.0)
+                
+                # Apply inverse scaling (* 0.001 for float features, no scaling for integer features)
+                if scale_with_thousand:
+                    value = float(value) * 0.001
+                else:
+                    value = float(value)
+                
+                # Remove negative offset if present
+                if negative_offset:
+                    value = value - negative_offset
                 
                 # Return NaN for missing or zero values
                 return np.nan if (value == 0 or np.isnan(value)) else value
