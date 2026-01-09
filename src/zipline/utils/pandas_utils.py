@@ -244,6 +244,30 @@ def categorical_df_concat(df_list, inplace=False):
             for df in df_list:
                 df[col] = df[col].cat.set_categories(new_categories)
 
+    # OPTIMIZATION: For large datasets, concatenate in chunks to reduce
+    # peak memory usage. This is especially important when concatenating
+    # many large DataFrames (e.g., from chunked pipeline execution).
+    total_rows = sum(len(df) for df in df_list)
+    num_dataframes = len(df_list)
+    
+    # Use chunked concatenation if we have many DataFrames or very large data
+    # Threshold: > 10 DataFrames AND > 1M total rows
+    if num_dataframes > 10 and total_rows > 1_000_000:
+        # Calculate optimal chunk size: aim for 3-5 chunks
+        chunk_size = max(3, num_dataframes // 4)
+        
+        result = None
+        for i in range(0, num_dataframes, chunk_size):
+            chunk = df_list[i:i + chunk_size]
+            if result is None:
+                # First chunk: start with the first chunk
+                result = pd.concat(chunk)
+            else:
+                # Subsequent chunks: append to existing result
+                result = pd.concat([result] + chunk)
+        return result
+    
+    # For smaller datasets, use standard concatenation
     return pd.concat(df_list)
 
 
