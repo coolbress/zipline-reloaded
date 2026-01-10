@@ -730,10 +730,10 @@ class SimplePipelineEngine(PipelineEngine):
         assets : ndarray[int64, ndim=2]
             Column index for arrays `data` and `mask`
         auto_downcast : bool, optional
-            If True, automatically analyze value ranges and downcast columns to optimal dtype:
-            - Columns with absolute values <= 65504: downcast to float16
-            - Columns with absolute values > 65504: downcast to float32
-            This reduces memory usage by ~75% compared to original float64.
+            If True, automatically downcast float64 columns to float32 to reduce memory usage.
+            This reduces memory usage by ~50% compared to original float64 while maintaining
+            sufficient precision for financial calculations (statistics, ML training).
+            Float32 is the minimum standard for financial data computations.
             Default is True.
             
             If False, keep original float64 dtype (original zipline behavior).
@@ -769,10 +769,6 @@ class SimplePipelineEngine(PipelineEngine):
         #     data["open_instance"].tofile("../../open_instance.dat")
         final_columns = {}
         
-        # Float16 범위 상수
-        FLOAT16_MAX = 65504.0
-        FLOAT16_MIN = -65504.0
-        
         for name in data:
             # Each term that computed an output has its postprocess method
             # called on the filtered result.
@@ -780,86 +776,18 @@ class SimplePipelineEngine(PipelineEngine):
             # Using this to convert np.records to tuples
             processed = terms[name].postprocess(data[name][mask])
             
-            # OPTIMIZATION: Smart downcasting based on value range
-            # If auto_downcast=True: analyze value ranges and automatically choose optimal dtype
-            #   - Values <= 65504: float16 (saves 75% vs float64)
-            #   - Values > 65504: float32 (saves 50% vs float64)
+            # OPTIMIZATION: Downcast float64 to float32 for memory efficiency
+            # If auto_downcast=True: downcast float64 to float32 (saves 50% memory)
+            #   - Float32 is the minimum standard for financial data computations
+            #   - Sufficient precision for statistics, ML training, and correlation analysis
             # If auto_downcast=False: keep original float64 (original zipline behavior)
             if auto_downcast:
                 if isinstance(processed, pd.Series):
                     if processed.dtype == np.float64:
-                        # Check value range for float16 compatibility
-                        valid_values = processed.dropna()
-                        if len(valid_values) > 0:
-                            min_val = valid_values.min()
-                            max_val = valid_values.max()
-                            abs_max = max(abs(min_val), abs(max_val))
-                            
-                            # If all values are within float16 range, use float16
-                            if abs_max <= FLOAT16_MAX:
-                                try:
-                                    processed = processed.astype(np.float16, copy=False)
-                                except (OverflowError, ValueError):
-                                    # Fallback to float32 if conversion fails
-                                    processed = processed.astype(np.float32, copy=False)
-                            else:
-                                # Values exceed float16 range, use float32
-                                processed = processed.astype(np.float32, copy=False)
-                        else:
-                            # All NaN, use float32
-                            processed = processed.astype(np.float32, copy=False)
-                    elif processed.dtype == np.float32:
-                        # Already float32, check if we can downcast to float16
-                        valid_values = processed.dropna()
-                        if len(valid_values) > 0:
-                            min_val = valid_values.min()
-                            max_val = valid_values.max()
-                            abs_max = max(abs(min_val), abs(max_val))
-                            
-                            if abs_max <= FLOAT16_MAX:
-                                try:
-                                    processed = processed.astype(np.float16, copy=False)
-                                except (OverflowError, ValueError):
-                                    # Keep float32 if conversion fails
-                                    pass
+                        processed = processed.astype(np.float32, copy=False)
                 elif isinstance(processed, np.ndarray):
                     if processed.dtype == np.float64:
-                        # Check value range for float16 compatibility
-                        valid_mask = ~np.isnan(processed)
-                        if valid_mask.any():
-                            valid_values = processed[valid_mask]
-                            min_val = np.min(valid_values)
-                            max_val = np.max(valid_values)
-                            abs_max = max(abs(min_val), abs(max_val))
-                            
-                            # If all values are within float16 range, use float16
-                            if abs_max <= FLOAT16_MAX:
-                                try:
-                                    processed = processed.astype(np.float16, copy=False)
-                                except (OverflowError, ValueError):
-                                    # Fallback to float32 if conversion fails
-                                    processed = processed.astype(np.float32, copy=False)
-                            else:
-                                # Values exceed float16 range, use float32
-                                processed = processed.astype(np.float32, copy=False)
-                        else:
-                            # All NaN, use float32
-                            processed = processed.astype(np.float32, copy=False)
-                    elif processed.dtype == np.float32:
-                        # Already float32, check if we can downcast to float16
-                        valid_mask = ~np.isnan(processed)
-                        if valid_mask.any():
-                            valid_values = processed[valid_mask]
-                            min_val = np.min(valid_values)
-                            max_val = np.max(valid_values)
-                            abs_max = max(abs(min_val), abs(max_val))
-                            
-                            if abs_max <= FLOAT16_MAX:
-                                try:
-                                    processed = processed.astype(np.float16, copy=False)
-                                except (OverflowError, ValueError):
-                                    # Keep float32 if conversion fails
-                                    pass
+                        processed = processed.astype(np.float32, copy=False)
             # If auto_downcast=False, keep original float64 (original zipline behavior)
             
             final_columns[name] = processed
