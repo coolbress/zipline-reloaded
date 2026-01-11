@@ -58,11 +58,14 @@ implements the following algorithm for executing pipelines:
 
 from abc import ABC, abstractmethod
 from functools import partial
+import os
 
 import pandas as pd
 import numpy as np
 from numpy import arange, array
 from toolz import groupby
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from zipline.errors import NoFurtherDataError
 from zipline.lib.adjusted_array import ensure_adjusted_array, ensure_ndarray
@@ -80,7 +83,7 @@ from .term import AssetExists, InputDates, LoadableTerm
 
 class PipelineEngine(ABC):
     @abstractmethod
-    def run_pipeline(self, pipeline, start_date, end_date, hooks=None):
+    def run_pipeline(self, pipeline, start_date, end_date, hooks=None, save_path=None):
         """Compute values for ``pipeline`` from ``start_date`` to ``end_date``.
 
         Parameters
@@ -93,6 +96,10 @@ class PipelineEngine(ABC):
             End date of the computed matrix.
         hooks : list[implements(PipelineHooks)], optional
             Hooks for instrumenting Pipeline execution.
+        save_path : str, optional
+            If provided, save the result to a Parquet file at this path.
+            The data will be transformed to a flat structure with Asset objects
+            converted to symbol strings and MultiIndex reset to columns.
 
         Returns
         -------
@@ -112,7 +119,7 @@ class PipelineEngine(ABC):
 
     @abstractmethod
     def run_chunked_pipeline(
-        self, pipeline, start_date, end_date, chunksize, hooks=None
+        self, pipeline, start_date, end_date, chunksize, hooks=None, save_path=None
     ):
         """Compute values for ``pipeline`` from ``start_date`` to ``end_date``, in
         date chunks of size ``chunksize``.
@@ -132,6 +139,9 @@ class PipelineEngine(ABC):
             The number of days to execute at a time.
         hooks : list[implements(PipelineHooks)], optional
             Hooks for instrumenting Pipeline execution.
+        save_path : str, optional
+            If provided, save each chunk to a Parquet file at this path.
+            Each chunk will be saved as a separate row group in the Parquet file.
 
         Returns
         -------
@@ -163,13 +173,13 @@ class NoEngineRegistered(Exception):
 class ExplodingPipelineEngine(PipelineEngine):
     """A PipelineEngine that doesn't do anything."""
 
-    def run_pipeline(self, pipeline, start_date, end_date, hooks=None):
+    def run_pipeline(self, pipeline, start_date, end_date, hooks=None, save_path=None):
         raise NoEngineRegistered(
             "Attempted to run a pipeline but no pipeline " "resources were registered."
         )
 
     def run_chunked_pipeline(
-        self, pipeline, start_date, end_date, chunksize, hooks=None
+        self, pipeline, start_date, end_date, chunksize, hooks=None, save_path=None
     ):
         raise NoEngineRegistered(
             "Attempted to run a chunked pipeline but no pipeline "
@@ -273,7 +283,7 @@ class SimplePipelineEngine(PipelineEngine):
             self._default_hooks = list(default_hooks)
 
     def run_chunked_pipeline(
-        self, pipeline, start_date, end_date, chunksize, hooks=None
+        self, pipeline, start_date, end_date, chunksize, hooks=None, save_path=None
     ):
         """Compute values for ``pipeline`` from ``start_date`` to ``end_date``, in
         date chunks of size ``chunksize``.
@@ -293,6 +303,11 @@ class SimplePipelineEngine(PipelineEngine):
             The number of days to execute at a time.
         hooks : list[implements(PipelineHooks)], optional
             Hooks for instrumenting Pipeline execution.
+        save_path : str, optional
+            If provided, save each chunk to a Parquet file at this path.
+            Each chunk will be saved as a separate row group in the Parquet file.
+            The data will be transformed to a flat structure with Asset objects
+            converted to symbol strings and MultiIndex reset to columns.
 
         Returns
         -------
@@ -322,9 +337,70 @@ class SimplePipelineEngine(PipelineEngine):
         hooks = self._resolve_hooks(hooks)
 
         run_pipeline = partial(self._run_pipeline_impl, pipeline, hooks=hooks)
-        with hooks.running_pipeline(pipeline, start_date, end_date):
-            chunks = [run_pipeline(s, e) for s, e in ranges]
+        
+        # Parquet Writer Setup
+        parquet_writer = None
+        parquet_schema = None
+        
+        if save_path is not None:
+            # Validate path (must have .parquet extension, create directory)
+            save_path = self._validate_parquet_path(save_path)
+        
+        chunks = []  # 반환용 리스트 (save_path가 없을 때만 사용)
 
+        with hooks.running_pipeline(pipeline, start_date, end_date):
+            for chunk_idx, (s, e) in enumerate(ranges):
+                chunk = run_pipeline(s, e)
+                
+                # 데이터가 비어있으면 스킵
+                if len(chunk) == 0:
+                    continue
+
+                # 1. 파일 저장 모드 (Stream-to-Disk)
+                if save_path is not None:
+                    # 변환 (속도 최적화 버전)
+                    chunk_for_parquet = self._prepare_chunk_for_parquet(chunk)
+                    
+                    # 스키마 정의 및 쓰기 (성능 최적화: 첫 청크에서 table 재사용)
+                    if parquet_schema is None:
+                        # 첫 청크: 스키마 생성 및 쓰기
+                        table = pa.Table.from_pandas(chunk_for_parquet, preserve_index=False)
+                        parquet_schema = table.schema
+                        parquet_writer = pq.ParquetWriter(
+                            save_path, 
+                            parquet_schema,
+                            compression='zstd',  # 압축 효율 극대화
+                            use_dictionary=True
+                        )
+                        parquet_writer.write_table(table)
+                    else:
+                        # 이후 청크: 스키마 재사용하여 쓰기
+                        table = pa.Table.from_pandas(chunk_for_parquet, preserve_index=False, schema=parquet_schema)
+                        parquet_writer.write_table(table)
+                    
+                    # 🚀 [핵심] 메모리 즉시 해제!
+                    # 리스트에 append 하지 않음.
+                    del chunk, chunk_for_parquet, table
+                    # 성능 최적화: gc.collect()는 매 chunk마다 호출하지 않고
+                    # 마지막에만 호출하거나 주기적으로만 호출 (매번 호출하면 오버헤드 큼)
+                    # Python GC가 자동으로 처리하므로 명시적 호출은 선택적
+
+                # 2. 일반 모드 (In-Memory)
+                else:
+                    chunks.append(chunk)
+        
+        # 리소스 정리
+        if parquet_writer is not None:
+            parquet_writer.close()
+
+        # 저장 모드였으면 빈 DataFrame 반환 (메모리 절약)
+        if save_path is not None:
+            return pd.DataFrame()
+
+        # 일반 모드였으면 합쳐서 반환
+        if len(chunks) == 0:
+            return pd.DataFrame()
+        
         if len(chunks) == 1:
             # OPTIMIZATION: Don't make an extra copy in `categorical_df_concat`
             # if we don't have to.
@@ -335,7 +411,7 @@ class SimplePipelineEngine(PipelineEngine):
         nonempty_chunks = [c for c in chunks if len(c)]
         return categorical_df_concat(nonempty_chunks, inplace=True)
 
-    def run_pipeline(self, pipeline, start_date, end_date, hooks=None):
+    def run_pipeline(self, pipeline, start_date, end_date, hooks=None, save_path=None):
         """Compute values for ``pipeline`` from ``start_date`` to ``end_date``.
 
         Parameters
@@ -348,6 +424,10 @@ class SimplePipelineEngine(PipelineEngine):
             End date of the computed matrix.
         hooks : list[implements(PipelineHooks)], optional
             Hooks for instrumenting Pipeline execution.
+        save_path : str, optional
+            If provided, save the result to a Parquet file at this path.
+            The data will be transformed to a flat structure with Asset objects
+            converted to symbol strings and MultiIndex reset to columns.
 
         Returns
         -------
@@ -365,12 +445,34 @@ class SimplePipelineEngine(PipelineEngine):
         """
         hooks = self._resolve_hooks(hooks)
         with hooks.running_pipeline(pipeline, start_date, end_date):
-            return self._run_pipeline_impl(
+            result = self._run_pipeline_impl(
                 pipeline,
                 start_date,
                 end_date,
                 hooks,
             )
+        
+        # Save to Parquet if save_path is provided
+        if save_path is not None and len(result) > 0:
+            # Validate path (must have .parquet extension, create directory)
+            save_path = self._validate_parquet_path(save_path)
+            
+            # Transform result for Parquet storage
+            result_for_parquet = self._prepare_chunk_for_parquet(result)
+            
+            # Write to Parquet file with compression (일관성 유지)
+            table = pa.Table.from_pandas(result_for_parquet, preserve_index=False)
+            pq.write_table(
+                table, 
+                save_path,
+                compression='zstd',  # run_chunked_pipeline과 동일한 압축
+                use_dictionary=True
+            )
+            
+            # 저장 모드였으면 빈 DataFrame 반환 (메모리 절약, run_chunked_pipeline과 일관성 유지)
+            return pd.DataFrame()
+        
+        return result
 
     def _run_pipeline_impl(self, pipeline, start_date, end_date, hooks):
         """Shared core for ``run_pipeline`` and ``run_chunked_pipeline``."""
@@ -889,6 +991,129 @@ class SimplePipelineEngine(PipelineEngine):
 
     def _is_special_root_term(self, term):
         return term is self._root_mask_term or term is self._root_mask_dates_term
+
+    @staticmethod
+    def _validate_parquet_path(save_path):
+        """Validate that save_path has .parquet extension.
+        
+        Parameters
+        ----------
+        save_path : str
+            File path for saving Parquet file. Must end with .parquet extension.
+            
+        Returns
+        -------
+        validated_path : str
+            Validated file path.
+            
+        Raises
+        ------
+        ValueError
+            If save_path does not end with .parquet extension.
+        """
+        if not save_path:
+            return save_path
+        
+        # 확장자가 .parquet가 아니면 에러 발생
+        if not save_path.endswith('.parquet'):
+            raise ValueError(
+                f"save_path must end with '.parquet' extension. "
+                f"Received: {save_path}"
+            )
+        
+        # 디렉토리 자동 생성
+        dir_path = os.path.dirname(save_path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+        
+        return save_path
+
+    def _prepare_chunk_for_parquet(self, chunk_df):
+        """
+        [Performance Optimized] Prepare chunk for Parquet.
+        MultiIndex를 직접 수정하는 대신, reset_index 후 컬럼 단위로 변환하여
+        'Level values must be unique' 에러를 방지합니다.
+        
+        This method transforms the chunk DataFrame according to the standard
+        Parquet storage format:
+        1. Resets MultiIndex to columns (date, asset -> date, symbol)
+        2. Converts Asset objects to symbol strings
+        3. Ensures float64 columns are downcast to float32
+        
+        Parameters
+        ----------
+        chunk_df : pd.DataFrame
+            DataFrame with MultiIndex (date, asset) from pipeline output.
+            
+        Returns
+        -------
+        prepared_df : pd.DataFrame
+            DataFrame with flat structure, Asset objects converted to symbols,
+            and MultiIndex reset to columns.
+        """
+        # 1. 원본 복사
+        df = chunk_df.copy()
+        
+        # 2. [Reset Index] 먼저 인덱스를 컬럼으로 내립니다. (MultiIndex 해제)
+        # 이렇게 하면 'level_0'(Date), 'level_1'(Asset) 컬럼이 생깁니다.
+        df = df.reset_index()
+        
+        # 3. [Asset -> Symbol] Asset 객체가 들어있는 컬럼을 찾아 문자열로 변환
+        # reset_index() 후 첫 두 컬럼이 보통 date(level_0), asset(level_1)입니다.
+        # 성능 최적화: len(df) 체크를 루프 밖으로, 컬럼 순서 활용
+        asset_col = None
+        date_col = None
+        
+        if len(df) > 0:
+            # reset_index() 후 첫 두 컬럼이 보통 date, asset이므로 우선 체크
+            cols = list(df.columns)
+            if len(cols) >= 2:
+                # 첫 번째 컬럼이 날짜일 가능성이 높음
+                first_col = cols[0]
+                if pd.api.types.is_datetime64_any_dtype(df[first_col]):
+                    date_col = first_col
+                    # 두 번째 컬럼이 Asset일 가능성이 높음
+                    if len(cols) > 1:
+                        second_col = cols[1]
+                        first_val = df[second_col].iloc[0]
+                        if hasattr(first_val, 'symbol'):
+                            asset_col = second_col
+            
+            # 위에서 찾지 못한 경우에만 전체 컬럼 순회
+            if asset_col is None or date_col is None:
+                for col in cols:
+                    if asset_col is not None and date_col is not None:
+                        break  # 둘 다 찾았으면 중단
+                    if asset_col is None:
+                        first_val = df[col].iloc[0]
+                        if hasattr(first_val, 'symbol'):
+                            asset_col = col
+                            continue
+                    if date_col is None:
+                        if pd.api.types.is_datetime64_any_dtype(df[col]):
+                            date_col = col
+        
+        # Asset 컬럼 변환 (map 사용이 apply보다 빠름)
+        if asset_col is not None:
+            df[asset_col] = df[asset_col].map(lambda x: x.symbol if hasattr(x, 'symbol') and x.symbol is not None else str(x))
+            # 컬럼 이름을 'symbol'로 변경
+            df.rename(columns={asset_col: 'symbol'}, inplace=True)
+            
+        # Date 컬럼 이름 표준화
+        if date_col is not None and date_col != 'date':
+            df.rename(columns={date_col: 'date'}, inplace=True)
+
+        # 4. [Float32 Downcast] 날짜/심볼 제외하고 숫자형만 변환
+        # 메모리 절약을 위해 float64 -> float32
+        # 성능 최적화: select_dtypes 결과를 리스트로 변환하지 않고 직접 사용
+        exclude_cols = {'date', 'symbol'}  # set으로 변경하여 O(1) 조회
+        float_cols = df.select_dtypes(include=['float64']).columns
+        float_cols = [c for c in float_cols if c not in exclude_cols]
+        
+        if len(float_cols) > 0:
+            df[float_cols] = df[float_cols].astype('float32', copy=False)
+            
+        return df
 
     def _resolve_hooks(self, hooks):
         if hooks is None:
