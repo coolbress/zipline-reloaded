@@ -145,8 +145,9 @@ class PipelineEngine(ABC):
 
         Returns
         -------
-        result : pd.DataFrame
-            A frame of computed results.
+        result : pd.DataFrame or str
+            If ``save_path`` is provided, returns the ``save_path`` string.
+            Otherwise, returns a frame of computed results.
 
             The ``result`` columns correspond to the entries of
             `pipeline.columns`, which should be a dictionary mapping strings to
@@ -311,8 +312,9 @@ class SimplePipelineEngine(PipelineEngine):
 
         Returns
         -------
-        result : pd.DataFrame
-            A frame of computed results.
+        result : pd.DataFrame or str
+            If ``save_path`` is provided, returns the ``save_path`` string.
+            Otherwise, returns a frame of computed results.
 
             The ``result`` columns correspond to the entries of
             `pipeline.columns`, which should be a dictionary mapping strings to
@@ -393,9 +395,9 @@ class SimplePipelineEngine(PipelineEngine):
         if parquet_writer is not None:
             parquet_writer.close()
 
-        # 저장 모드였으면 빈 DataFrame 반환 (메모리 절약)
+        # 저장 모드였으면 save_path 반환
         if save_path is not None:
-            return pd.DataFrame()
+            return save_path
 
         # 일반 모드였으면 합쳐서 반환
         if len(chunks) == 0:
