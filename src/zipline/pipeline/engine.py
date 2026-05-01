@@ -350,50 +350,45 @@ class SimplePipelineEngine(PipelineEngine):
         
         chunks = []  # 반환용 리스트 (save_path가 없을 때만 사용)
 
-        with hooks.running_pipeline(pipeline, start_date, end_date):
-            for chunk_idx, (s, e) in enumerate(ranges):
-                chunk = run_pipeline(s, e)
-                
-                # 데이터가 비어있으면 스킵
-                if len(chunk) == 0:
-                    continue
+        try:
+            with hooks.running_pipeline(pipeline, start_date, end_date):
+                for chunk_idx, (s, e) in enumerate(ranges):
+                    chunk = run_pipeline(s, e)
 
-                # 1. 파일 저장 모드 (Stream-to-Disk)
-                if save_path is not None:
-                    # 변환 (속도 최적화 버전)
-                    chunk_for_parquet = self._prepare_chunk_for_parquet(chunk)
-                    
-                    # 스키마 정의 및 쓰기 (성능 최적화: 첫 청크에서 table 재사용)
-                    if parquet_schema is None:
-                        # 첫 청크: 스키마 생성 및 쓰기
-                        table = pa.Table.from_pandas(chunk_for_parquet, preserve_index=False)
-                        parquet_schema = table.schema
-                        parquet_writer = pq.ParquetWriter(
-                            save_path, 
-                            parquet_schema,
-                            compression='zstd',  # 압축 효율 극대화
-                            use_dictionary=True
-                        )
-                        parquet_writer.write_table(table)
+                    # 데이터가 비어있으면 스킵
+                    if len(chunk) == 0:
+                        continue
+
+                    # 1. 파일 저장 모드 (Stream-to-Disk)
+                    if save_path is not None:
+                        # 변환 (속도 최적화 버전)
+                        chunk_for_parquet = self._prepare_chunk_for_parquet(chunk)
+
+                        # 스키마 정의 및 쓰기 (성능 최적화: 첫 청크에서 table 재사용)
+                        if parquet_schema is None:
+                            # 첫 청크: 스키마 생성 및 쓰기
+                            table = pa.Table.from_pandas(chunk_for_parquet, preserve_index=False)
+                            parquet_schema = table.schema
+                            parquet_writer = pq.ParquetWriter(
+                                save_path,
+                                parquet_schema,
+                                compression='zstd',
+                                use_dictionary=True
+                            )
+                            parquet_writer.write_table(table)
+                        else:
+                            # 이후 청크: 스키마 재사용하여 쓰기
+                            table = pa.Table.from_pandas(chunk_for_parquet, preserve_index=False, schema=parquet_schema)
+                            parquet_writer.write_table(table)
+
+                        del chunk, chunk_for_parquet, table
+
+                    # 2. 일반 모드 (In-Memory)
                     else:
-                        # 이후 청크: 스키마 재사용하여 쓰기
-                        table = pa.Table.from_pandas(chunk_for_parquet, preserve_index=False, schema=parquet_schema)
-                        parquet_writer.write_table(table)
-                    
-                    # 🚀 [핵심] 메모리 즉시 해제!
-                    # 리스트에 append 하지 않음.
-                    del chunk, chunk_for_parquet, table
-                    # 성능 최적화: gc.collect()는 매 chunk마다 호출하지 않고
-                    # 마지막에만 호출하거나 주기적으로만 호출 (매번 호출하면 오버헤드 큼)
-                    # Python GC가 자동으로 처리하므로 명시적 호출은 선택적
-
-                # 2. 일반 모드 (In-Memory)
-                else:
-                    chunks.append(chunk)
-        
-        # 리소스 정리
-        if parquet_writer is not None:
-            parquet_writer.close()
+                        chunks.append(chunk)
+        finally:
+            if parquet_writer is not None:
+                parquet_writer.close()
 
         # 저장 모드였으면 save_path 반환
         if save_path is not None:
@@ -1053,57 +1048,28 @@ class SimplePipelineEngine(PipelineEngine):
             DataFrame with flat structure, Asset objects converted to symbols,
             and MultiIndex reset to columns.
         """
-        # 1. 원본 복사
-        df = chunk_df.copy()
-        
-        # 2. [Reset Index] 먼저 인덱스를 컬럼으로 내립니다. (MultiIndex 해제)
-        # 이렇게 하면 'level_0'(Date), 'level_1'(Asset) 컬럼이 생깁니다.
-        df = df.reset_index()
-        
-        # 3. [Asset -> Symbol] Asset 객체가 들어있는 컬럼을 찾아 문자열로 변환
-        # reset_index() 후 첫 두 컬럼이 보통 date(level_0), asset(level_1)입니다.
-        # 성능 최적화: len(df) 체크를 루프 밖으로, 컬럼 순서 활용
-        asset_col = None
-        date_col = None
-        
-        if len(df) > 0:
-            # reset_index() 후 첫 두 컬럼이 보통 date, asset이므로 우선 체크
-            cols = list(df.columns)
-            if len(cols) >= 2:
-                # 첫 번째 컬럼이 날짜일 가능성이 높음
-                first_col = cols[0]
-                if pd.api.types.is_datetime64_any_dtype(df[first_col]):
-                    date_col = first_col
-                    # 두 번째 컬럼이 Asset일 가능성이 높음
-                    if len(cols) > 1:
-                        second_col = cols[1]
-                        first_val = df[second_col].iloc[0]
-                        if hasattr(first_val, 'symbol'):
-                            asset_col = second_col
-            
-            # 위에서 찾지 못한 경우에만 전체 컬럼 순회
-            if asset_col is None or date_col is None:
-                for col in cols:
-                    if asset_col is not None and date_col is not None:
-                        break  # 둘 다 찾았으면 중단
-                    if asset_col is None:
-                        first_val = df[col].iloc[0]
-                        if hasattr(first_val, 'symbol'):
-                            asset_col = col
-                            continue
-                    if date_col is None:
-                        if pd.api.types.is_datetime64_any_dtype(df[col]):
-                            date_col = col
-        
-        # Asset 컬럼 변환 (map 사용이 apply보다 빠름)
+        # reset_index() creates a new DataFrame — no copy needed.
+        # Pipeline MultiIndex always has named levels ('date', 'asset').
+        index_names = list(chunk_df.index.names)
+        df = chunk_df.reset_index()
+
+        # Resolve the asset and date column names from the known index level names.
+        date_col = next((n for n in index_names if n == "date"), None) or next(
+            (c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])), None
+        )
+        asset_col = next((n for n in index_names if n == "asset"), None) or next(
+            (c for c in df.columns if c != date_col and len(df) > 0 and hasattr(df[c].iloc[0], "symbol")),
+            None,
+        )
+
         if asset_col is not None:
-            df[asset_col] = df[asset_col].map(lambda x: x.symbol if hasattr(x, 'symbol') and x.symbol is not None else str(x))
-            # 컬럼 이름을 'symbol'로 변경
-            df.rename(columns={asset_col: 'symbol'}, inplace=True)
-            
-        # Date 컬럼 이름 표준화
-        if date_col is not None and date_col != 'date':
-            df.rename(columns={date_col: 'date'}, inplace=True)
+            df[asset_col] = df[asset_col].map(
+                lambda x: x.symbol if hasattr(x, "symbol") and x.symbol is not None else str(x)
+            )
+            df.rename(columns={asset_col: "symbol"}, inplace=True)
+
+        if date_col is not None and date_col != "date":
+            df.rename(columns={date_col: "date"}, inplace=True)
 
         # 4. [Float32 Downcast] 날짜/심볼 제외하고 숫자형만 변환
         # 메모리 절약을 위해 float64 -> float32

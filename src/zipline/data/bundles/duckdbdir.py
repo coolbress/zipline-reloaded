@@ -131,12 +131,25 @@ def _ingest_bundle(
     symbol_to_sid: dict[str, int] = {sym: i for i, sym in enumerate(symbols)}
 
     # 1. Write pricing data (bcolz pre-write).
-    for tframe in tframes:
-        writer = daily_bar_writer  # minute not supported in v1
-        writer.write(
-            _pricing_iter(conn, schema, symbols, feature_cols, show_progress),
-            show_progress=show_progress,
+    # Only "daily" is supported in v1.  Minute support requires:
+    #   - A separate staging table (e.g. <schema>.ohlcv_1m) in fyan_computed.duckdb
+    #   - A _minute_iter() generator that yields (sid, minute_df) with
+    #     a DatetimeIndex in UTC and OHLCV columns
+    #   - Dispatching to minute_bar_writer for tframe == "minute"
+    # When that is ready, replace the guard below with:
+    #   writers = {"daily": daily_bar_writer, "minute": minute_bar_writer}
+    #   iters   = {"daily": _pricing_iter,    "minute": _minute_iter}
+    #   for tframe in tframes:
+    #       writers[tframe].write(iters[tframe](...), show_progress=show_progress)
+    unsupported = [t for t in tframes if t != "daily"]
+    if unsupported:
+        raise NotImplementedError(
+            f"duckdbdir bundle only supports 'daily' in v1; unsupported: {unsupported}"
         )
+    daily_bar_writer.write(
+        _pricing_iter(conn, schema, symbols, feature_cols, show_progress),
+        show_progress=show_progress,
+    )
 
     # 2. Write asset metadata.
     _write_assets(conn, schema, symbols, symbol_to_sid, calendar, asset_db_writer)
@@ -166,26 +179,33 @@ def _pricing_iter(
 ) -> Generator[tuple[int, pd.DataFrame], None, None]:
     """Yield (sid, df) for each symbol from <schema>.ohlcv_features."""
     extra = (", " + ", ".join(feature_cols)) if feature_cols else ""
+
+    # Single query for all symbols — avoids N+1 round-trips to DuckDB.
+    full: pd.DataFrame = conn.execute(
+        f"""
+        SELECT symbol, date, open, high, low, close, volume{extra}
+        FROM {schema}.ohlcv_features
+        ORDER BY symbol, date
+        """
+    ).df()
+
+    # Normalise date column to tz-aware UTC regardless of what DuckDB returns.
+    dates = pd.to_datetime(full["date"])
+    if dates.dt.tz is not None:
+        full["date"] = dates.dt.tz_convert("UTC")
+    else:
+        full["date"] = dates.dt.tz_localize("UTC")
+
+    full = full.set_index("date")
+
     with maybe_show_progress(
         symbols, show_progress, label="Loading daily pricing data: "
     ) as it:
         for sid, symbol in enumerate(it):
-            df: pd.DataFrame = conn.execute(
-                f"""
-                SELECT date, open, high, low, close, volume{extra}
-                FROM {schema}.ohlcv_features
-                WHERE symbol = ?
-                ORDER BY date
-                """,
-                [symbol],
-            ).df()
-
+            df = full.loc[full["symbol"] == symbol].drop(columns=["symbol"])
             if df.empty:
                 logger.warning("No pricing data for symbol %s (sid %d)", symbol, sid)
                 continue
-
-            df["date"] = pd.to_datetime(df["date"]).dt.tz_localize("UTC")
-            df.set_index("date", inplace=True)
             yield sid, df
 
 
@@ -213,26 +233,18 @@ def _write_assets(
     if assets_raw.empty:
         raise ValueError(f"No rows found in {schema}.assets")
 
-    dtype = [
-        ("start_date", "datetime64[ns]"),
-        ("end_date", "datetime64[ns]"),
-        ("auto_close_date", "datetime64[ns]"),
-        ("symbol", "object"),
-        ("exchange", "object"),
-    ]
-    equities = pd.DataFrame(np.empty(len(symbols), dtype=dtype))
+    # Vectorised construction — reindex into symbols order (same stable sid order).
+    asset_lookup = assets_raw.set_index("symbol").reindex(symbols)
+    start_dates = pd.to_datetime(asset_lookup["start_date"]).dt.normalize()
+    end_dates = pd.to_datetime(asset_lookup["end_date"]).dt.normalize()
 
-    asset_lookup = assets_raw.set_index("symbol")
-    for sid, symbol in enumerate(symbols):
-        row = asset_lookup.loc[symbol]
-        end_dt = pd.Timestamp(row["end_date"])
-        equities.iloc[sid] = (
-            pd.Timestamp(row["start_date"]).tz_localize(None),
-            end_dt.tz_localize(None),
-            (end_dt + pd.Timedelta(days=1)).tz_localize(None),
-            symbol,
-            row["exchange"],
-        )
+    equities = pd.DataFrame({
+        "start_date": start_dates.values,
+        "end_date": end_dates.values,
+        "auto_close_date": (end_dates + pd.Timedelta(days=1)).values,
+        "symbol": symbols,
+        "exchange": asset_lookup["exchange"].values,
+    })
 
     # Derive exchange label and country code from the first asset row.
     exchange_label = str(equities["exchange"].iloc[0])
@@ -275,6 +287,9 @@ def _read_ratio_table(
     if rows.empty:
         return empty
 
+    rows = rows[rows["symbol"].isin(symbol_to_sid)]
+    if rows.empty:
+        return empty
     rows["sid"] = rows["symbol"].map(symbol_to_sid).astype("int64")
     rows[date_col] = _to_epoch_days(rows[date_col])
     return rows[["sid", "ratio", date_col]].reset_index(drop=True)
@@ -309,6 +324,9 @@ def _read_dividends(
     if rows.empty:
         return empty
 
+    rows = rows[rows["symbol"].isin(symbol_to_sid)]
+    if rows.empty:
+        return empty
     rows["sid"] = rows["symbol"].map(symbol_to_sid).astype("int64")
     for dcol in ("ex_date", "declared_date", "record_date", "pay_date"):
         rows[dcol] = _to_epoch_days(rows[dcol], fill_null=0)
@@ -325,6 +343,6 @@ def _read_dividends(
 
 def _to_epoch_days(series: pd.Series, fill_null: int = 0) -> pd.Series:
     """Convert a date column to integer epoch days (NaT / NULL → fill_null)."""
-    dt = pd.to_datetime(series, errors="coerce")
+    dt = pd.to_datetime(series, errors="coerce").dt.normalize()
     days = (dt - pd.Timestamp("1970-01-01")) / pd.Timedelta("1D")
     return days.fillna(fill_null).astype("int64")
