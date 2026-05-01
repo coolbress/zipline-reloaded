@@ -177,35 +177,36 @@ def _pricing_iter(
     feature_cols: list[str],
     show_progress: bool,
 ) -> Generator[tuple[int, pd.DataFrame], None, None]:
-    """Yield (sid, df) for each symbol from <schema>.ohlcv_features."""
-    extra = (", " + ", ".join(feature_cols)) if feature_cols else ""
+    """Yield (sid, df) for each symbol from <schema>.ohlcv_features.
 
-    # Single query for all symbols — avoids N+1 round-trips to DuckDB.
-    full: pd.DataFrame = conn.execute(
-        f"""
-        SELECT symbol, date, open, high, low, close, volume{extra}
-        FROM {schema}.ohlcv_features
-        ORDER BY symbol, date
-        """
-    ).df()
-
-    # Normalise date column to tz-aware UTC regardless of what DuckDB returns.
-    dates = pd.to_datetime(full["date"])
-    if dates.dt.tz is not None:
-        full["date"] = dates.dt.tz_convert("UTC")
-    else:
-        full["date"] = dates.dt.tz_localize("UTC")
-
-    full = full.set_index("date")
+    One query per symbol keeps peak RSS bounded to a single symbol's rows
+    (~13 K rows at 200 M total / 15 K symbols) regardless of universe size.
+    DuckDB evaluates the WHERE symbol = ? filter via zone maps on sorted data,
+    so each query is fast even on a 200 M-row file.
+    """
+    cols_sql = "date, open, high, low, close, volume"
+    if feature_cols:
+        cols_sql += ", " + ", ".join(feature_cols)
 
     with maybe_show_progress(
         symbols, show_progress, label="Loading daily pricing data: "
     ) as it:
         for sid, symbol in enumerate(it):
-            df = full.loc[full["symbol"] == symbol].drop(columns=["symbol"])
+            df = conn.execute(
+                f"SELECT {cols_sql} FROM {schema}.ohlcv_features"
+                " WHERE symbol = ? ORDER BY date",
+                [symbol],
+            ).df()
             if df.empty:
                 logger.warning("No pricing data for symbol %s (sid %d)", symbol, sid)
                 continue
+            # Normalise date column to tz-aware UTC regardless of what DuckDB returns.
+            dates = pd.to_datetime(df["date"])
+            if dates.dt.tz is not None:
+                df["date"] = dates.dt.tz_convert("UTC")
+            else:
+                df["date"] = dates.dt.tz_localize("UTC")
+            df = df.set_index("date")
             yield sid, df
 
 
