@@ -513,7 +513,7 @@ class BcolzDailyBarWriter:
         table : bcolz.ctable
             The newly-written table with OHLCV and feature columns. 
         """
-        # Data is in (sid, df) format from factory functions (hdfdir, csvdir)
+        # Data is in (sid, df) format from factory functions (duckdbdir, csvdir)
         # df contains OHLCV + Features in a single DataFrame
         # data is a generator (original Zipline pattern)
         

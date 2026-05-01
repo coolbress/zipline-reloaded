@@ -520,7 +520,6 @@ def update_bundle(bundle, timestamp, data_file, data_format, symbol_column):
     try:
         from zipline.data.bcolz_daily_bars import BcolzDailyBarWriter
         from zipline.data.bundles.parquetdir import _parquet_pricing_iter
-        from zipline.data.bundles.hdfdir import _hdf5_pricing_iter
         import polars as pl
     except ImportError as e:
         click.echo(f"Error: V2 Writer not available: {e}", err=True)
@@ -783,37 +782,9 @@ def add_feature(
     
     # Process based on format
     if data_format == "hdf5":
-        # HDF5 format: extract all features automatically
-        try:
-            import h5py
-            from zipline.data.bundles.hdfdir import _extract_features_from_hdf5
-            
-            # Create metadata DataFrame from asset_finder for symbol mapping
-            metadata = pd.DataFrame({
-                'symbol': [asset.symbol for asset in all_assets],
-            })
-            metadata.index = [asset.sid for asset in all_assets]
-            
-            # Get symbols from HDF5 file
-            with h5py.File(feature_file, 'r') as hdf:
-                hdf_symbols = sorted(hdf.keys())
-                
-                click.echo(f"Adding features from HDF5 file: {feature_file}")
-                click.echo(f"  Found {len(hdf_symbols)} symbols in HDF5 file")
-                
-                # Extract and add all features
-                _extract_features_from_hdf5(
-                    hdf,
-                    writer,
-                    hdf_symbols,
-                    metadata,
-                    show_progress=True
-                )
-        
-        except Exception as e:
-            click.echo(f"Error processing HDF5 file: {e}", err=True)
-            raise click.Abort()
-    
+        click.echo("HDF5 feature format is not supported. Use parquet or csv.", err=True)
+        raise click.Abort()
+
     elif data_format in ["parquet", "csv"]:
         # CSV/Parquet format: single feature
         if not feature_name:
