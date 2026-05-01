@@ -44,8 +44,7 @@ if sys.version_info[0:2] <= (3, 10):
         + ("co_firstlineno", "co_lnotab")
         + _code_argorder_tail
     )
-
-else:
+elif sys.version_info[0:2] == (3, 11):
     _code_argorder = (
         _code_argorder_head
         + _code_argorder_body
@@ -54,6 +53,18 @@ else:
             "co_firstlineno",
             "co_lnotab",
             "co_exceptiontable",  # new in 3.11
+        )
+        + _code_argorder_tail
+    )
+else:  # 3.12+: co_lnotab deprecated; CodeType constructor takes linetable
+    _code_argorder = (
+        _code_argorder_head
+        + _code_argorder_body
+        + (
+            "co_qualname",
+            "co_firstlineno",
+            "co_linetable",      # replaces co_lnotab in 3.12+
+            "co_exceptiontable",
         )
         + _code_argorder_tail
     )
@@ -248,7 +259,7 @@ def _build_preprocessed_function(func, processors, args_defaults, varargs, varkw
     new_func = exec_locals[func.__name__]
 
     code = new_func.__code__
-    args = {attr: getattr(code, attr) for attr in dir(code) if attr.startswith("co_")}
+    args = {attr: getattr(code, attr) for attr in _code_argorder}
     # Copy the firstlineno out of the underlying function so that exceptions
     # get raised with the correct traceback.
     # This also makes dynamic source inspection (like IPython `??` operator)
