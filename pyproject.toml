@@ -63,8 +63,8 @@ dependencies = [
     'toolz >=0.8.2',
     'tqdm >=4.64.0',
     'pyarrow >=10.0.0',
-    # 변경: 포크된 exchange-calendars 사용
-    'exchange-calendars @ git+https://github.com/coolbress/exchange_calendars.git@feature/custom-data-calendar'
+    'exchange-calendars >=4.5',
+    'duckdb >=1.0',
 ]
 
 [project.urls]

@@ -1869,7 +1869,7 @@ class WithSeededRandomPipelineEngine(WithTradingSessions, WithAssetFinder):
         row_slice = self.trading_days.slice_indexer(start_date, end_date)
         return all_values[row_slice]
 
-    def run_pipeline(self, pipeline, start_date, end_date, hooks=None):
+    def run_pipeline(self, pipeline, start_date, end_date, hooks=None, save_path=None):
         """
         Run a pipeline with self.seeded_random_engine.
         """
@@ -1878,10 +1878,11 @@ class WithSeededRandomPipelineEngine(WithTradingSessions, WithAssetFinder):
             start_date,
             end_date,
             hooks=hooks,
+            save_path=save_path,
         )
 
     def run_chunked_pipeline(
-        self, pipeline, start_date, end_date, chunksize, hooks=None
+        self, pipeline, start_date, end_date, chunksize, hooks=None, save_path=None
     ):
         """
         Run a chunked pipeline with self.seeded_random_engine.
@@ -1892,6 +1893,7 @@ class WithSeededRandomPipelineEngine(WithTradingSessions, WithAssetFinder):
             end_date,
             chunksize=chunksize,
             hooks=hooks,
+            save_path=save_path,
         )
 
 
