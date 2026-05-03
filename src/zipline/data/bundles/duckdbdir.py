@@ -3,16 +3,46 @@
 Replaces hdfdir.py.  Reads directly from fyan_computed.duckdb staging tables
 (materialised by Compute Engine R1–R6) — no intermediate file format.
 
-Registration (in Fyan's engine/bundle.py via _isolation.py):
+Registration examples (in Fyan's engine/bundle.py via _isolation.py):
+
+    # Daily US equities — NYSE calendar
     bundles.register(
         "us_equities",
         duckdb_equities("/path/to/fyan_computed.duckdb"),
         calendar_name="NYSE",
     )
 
+    # Daily crypto (Upbit) — 24/7 AlwaysOpenCalendar
+    bundles.register(
+        "upbit_daily",
+        duckdb_equities("/path/to/fyan_computed.duckdb"),
+        calendar_name="24/7",
+    )
+
+    # Minute crypto (Upbit 1-min) — 24/7, 1440 min/day
+    bundles.register(
+        "upbit_1m",
+        duckdb_equities(
+            "/path/to/fyan_computed.duckdb",
+            tframes=("daily", "minute"),
+            minute_table="ohlcv_minute",
+        ),
+        calendar_name="24/7",
+        minutes_per_day=1440,   # AlwaysOpenCalendar: 1440 min/session, NOT 390
+    )
+
 If duckdb_path is omitted the ingester falls back to the FYAN_COMPUTED_PATH
 env-var, which the Compute Engine sets on the subprocess.  FYAN_BUNDLE_NAME
 selects the staging schema (<bundle_name>.*) to read.
+
+Staging table contracts
+-----------------------
+Daily:  <bundle>.ohlcv_features  — columns: symbol, date (DATE), open, high, low,
+                                    close, volume (all float64), + optional feature cols
+Minute: <bundle>.ohlcv_minute    — columns: symbol, date (TIMESTAMP UTC), open, high,
+                                    low, close, volume (all float64); no feature cols
+Both tables use the canonical column name "date" for the time axis regardless of grain.
+Timezone: minute timestamps must be UTC-naive or UTC-aware; the ingester normalises both.
 """
 
 from __future__ import annotations
@@ -42,6 +72,7 @@ def duckdb_equities(
     duckdb_path: str | None = None,
     tframes: tuple[str, ...] = ("daily",),
     calendar_name: str = "NYSE",
+    minute_table: str = "ohlcv_minute",
 ):
     """Curried factory.  Returns the bound ingest callable zipline will invoke.
 
@@ -51,9 +82,14 @@ def duckdb_equities(
         Absolute path to fyan_computed.duckdb.  Falls back to
         ``os.environ["FYAN_COMPUTED_PATH"]`` if not supplied.
     tframes:
-        Time-frame names.  Only "daily" is supported in v1.
+        Subset of ``{"daily", "minute"}`` to ingest.  Default is ``("daily",)``.
+        For minute support register with ``minutes_per_day`` matching the calendar
+        (e.g. 1440 for ``"24/7"``, 390 for ``"NYSE"``).
     calendar_name:
         Trading calendar (forwarded to bundles.register at registration site).
+    minute_table:
+        Name of the staging table holding minute OHLCV inside the bundle schema.
+        Default ``"ohlcv_minute"``.  Ignored when ``"minute"`` not in *tframes*.
     """
 
     def ingest(
@@ -90,8 +126,10 @@ def duckdb_equities(
                 tframes=tframes,
                 calendar=calendar,
                 daily_bar_writer=daily_bar_writer,
+                minute_bar_writer=minute_bar_writer,
                 asset_db_writer=asset_db_writer,
                 adjustment_writer=adjustment_writer,
+                minute_table=minute_table,
                 show_progress=show_progress,
             )
 
@@ -103,58 +141,69 @@ def duckdb_equities(
 # ---------------------------------------------------------------------------
 
 
+_SUPPORTED_TFRAMES: frozenset[str] = frozenset({"daily", "minute"})
+
+
 def _ingest_bundle(
     conn: duckdb.DuckDBPyConnection,
     bundle_name: str,
     tframes: tuple[str, ...],
     calendar,
     daily_bar_writer,
+    minute_bar_writer,
     asset_db_writer,
     adjustment_writer,
+    minute_table: str,
     show_progress: bool,
 ) -> None:
     schema = bundle_name
 
-    # Discover feature columns (non-OHLCV) from staging table schema.
-    describe_rows = conn.execute(f"DESCRIBE {schema}.ohlcv_features").fetchall()
+    unknown = [t for t in tframes if t not in _SUPPORTED_TFRAMES]
+    if unknown:
+        raise NotImplementedError(
+            f"duckdbdir: unsupported tframes {unknown!r}; supported: {sorted(_SUPPORTED_TFRAMES)}"
+        )
+
+    # Primary table drives symbol discovery and feature-column enumeration.
+    # When both daily and minute are requested, daily is primary (features live there).
+    primary_table = "ohlcv_features" if "daily" in tframes else minute_table
+
+    describe_rows = conn.execute(f"DESCRIBE {schema}.{primary_table}").fetchall()
     all_cols = [row[0] for row in describe_rows]
     feature_cols = [c for c in all_cols if c not in _OHLCV_COLS]
 
     # Stable sid assignment: sorted symbol order, same as asset metadata below.
     symbol_rows = conn.execute(
-        f"SELECT DISTINCT symbol FROM {schema}.ohlcv_features ORDER BY symbol"
+        f"SELECT DISTINCT symbol FROM {schema}.{primary_table} ORDER BY symbol"
     ).fetchall()
     symbols: list[str] = [r[0] for r in symbol_rows]
     if not symbols:
-        raise ValueError(f"No symbols found in {schema}.ohlcv_features")
+        raise ValueError(f"No symbols found in {schema}.{primary_table}")
 
     symbol_to_sid: dict[str, int] = {sym: i for i, sym in enumerate(symbols)}
 
-    # 1. Write pricing data (bcolz pre-write).
-    # Only "daily" is supported in v1.  Minute support requires:
-    #   - A separate staging table (e.g. <schema>.ohlcv_1m) in fyan_computed.duckdb
-    #   - A _minute_iter() generator that yields (sid, minute_df) with
-    #     a DatetimeIndex in UTC and OHLCV columns
-    #   - Dispatching to minute_bar_writer for tframe == "minute"
-    # When that is ready, replace the guard below with:
-    #   writers = {"daily": daily_bar_writer, "minute": minute_bar_writer}
-    #   iters   = {"daily": _pricing_iter,    "minute": _minute_iter}
-    #   for tframe in tframes:
-    #       writers[tframe].write(iters[tframe](...), show_progress=show_progress)
-    unsupported = [t for t in tframes if t != "daily"]
-    if unsupported:
-        raise NotImplementedError(
-            f"duckdbdir bundle only supports 'daily' in v1; unsupported: {unsupported}"
-        )
-    daily_bar_writer.write(
-        _pricing_iter(conn, schema, symbols, feature_cols, show_progress),
-        show_progress=show_progress,
-    )
+    # 1. Write pricing data — dispatch per tframe.
+    # Both daily and minute share _pricing_iter; the table name and feature_cols differ.
+    # Minute staging table contract: (symbol, date TIMESTAMP UTC, open, high, low, close, volume)
+    # "date" column name is canonical regardless of grain (same as transformer R6 output).
+    writers = {"daily": daily_bar_writer, "minute": minute_bar_writer}
+    pricing_iters = {
+        "daily": lambda: _pricing_iter(
+            conn, schema, "ohlcv_features", symbols, feature_cols, show_progress,
+            label="Loading daily pricing data: ",
+        ),
+        "minute": lambda: _pricing_iter(
+            conn, schema, minute_table, symbols, [], show_progress,
+            label="Loading minute pricing data: ",
+        ),
+    }
+    for tframe in tframes:
+        writers[tframe].write(pricing_iters[tframe](), show_progress=show_progress)
 
     # 2. Write asset metadata.
     _write_assets(conn, schema, symbols, symbol_to_sid, calendar, asset_db_writer)
 
-    # 3. Write adjustments.
+    # 3. Write adjustments (crypto bundles will have empty tables — handled gracefully).
     splits_df = _read_ratio_table(conn, schema, "splits", symbol_to_sid)
     mergers_df = _read_ratio_table(conn, schema, "mergers", symbol_to_sid)
     dividends_df = _read_dividends(conn, schema, symbol_to_sid)
@@ -173,34 +222,38 @@ def _ingest_bundle(
 def _pricing_iter(
     conn: duckdb.DuckDBPyConnection,
     schema: str,
+    table: str,
     symbols: list[str],
     feature_cols: list[str],
     show_progress: bool,
+    label: str = "Loading pricing data: ",
 ) -> Generator[tuple[int, pd.DataFrame], None, None]:
-    """Yield (sid, df) for each symbol from <schema>.ohlcv_features.
+    """Yield (sid, df) for each symbol from <schema>.<table>.
+
+    Works for both daily (ohlcv_features, DATE "date" column) and minute
+    (ohlcv_minute, TIMESTAMP UTC "date" column) staging tables — the "date"
+    column name is canonical regardless of grain (transformer R6 contract).
 
     One query per symbol keeps peak RSS bounded to a single symbol's rows
-    (~13 K rows at 200 M total / 15 K symbols) regardless of universe size.
-    DuckDB evaluates the WHERE symbol = ? filter via zone maps on sorted data,
-    so each query is fast even on a 200 M-row file.
+    regardless of universe size.  DuckDB evaluates the WHERE clause via zone
+    maps on sorted data so each query is fast even on a 200 M-row file.
     """
     cols_sql = "date, open, high, low, close, volume"
     if feature_cols:
         cols_sql += ", " + ", ".join(feature_cols)
 
-    with maybe_show_progress(
-        symbols, show_progress, label="Loading daily pricing data: "
-    ) as it:
+    with maybe_show_progress(symbols, show_progress, label=label) as it:
         for sid, symbol in enumerate(it):
             df = conn.execute(
-                f"SELECT {cols_sql} FROM {schema}.ohlcv_features"
+                f"SELECT {cols_sql} FROM {schema}.{table}"
                 " WHERE symbol = ? ORDER BY date",
                 [symbol],
             ).df()
             if df.empty:
-                logger.warning("No pricing data for symbol %s (sid %d)", symbol, sid)
+                logger.warning("No pricing data for symbol %s (sid %d) in %s", symbol, sid, table)
                 continue
             # Normalise date column to tz-aware UTC regardless of what DuckDB returns.
+            # Handles both DATE (daily) and TIMESTAMP (minute) column types.
             dates = pd.to_datetime(df["date"])
             if dates.dt.tz is not None:
                 df["date"] = dates.dt.tz_convert("UTC")
