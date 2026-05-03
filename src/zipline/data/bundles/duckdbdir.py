@@ -289,8 +289,10 @@ def _write_assets(
 
     # Vectorised construction — reindex into symbols order (same stable sid order).
     asset_lookup = assets_raw.set_index("symbol").reindex(symbols)
-    start_dates = pd.to_datetime(asset_lookup["start_date"]).dt.normalize()
-    end_dates = pd.to_datetime(asset_lookup["end_date"]).dt.normalize()
+    # DuckDB DATE columns come back as datetime64[us]; asset_db_writer._dt_to_epoch_ns
+    # calls .view(int64) which must see nanoseconds — upcast explicitly.
+    start_dates = pd.to_datetime(asset_lookup["start_date"]).dt.normalize().dt.as_unit("ns")
+    end_dates = pd.to_datetime(asset_lookup["end_date"]).dt.normalize().dt.as_unit("ns")
 
     equities = pd.DataFrame({
         "start_date": start_dates.values,
