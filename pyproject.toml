@@ -343,3 +343,8 @@ commands = {[pytest_commands]without_cov}
 [testenv:py{310,311,312,313}-pandas{15,20}-numpy{1,20,21,22}]
 commands = {[pytest_commands]without_cov}
 """
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
