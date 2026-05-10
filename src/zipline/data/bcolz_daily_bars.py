@@ -210,7 +210,7 @@ class BcolzDailyBarWriter:
         if feature_metadata is None:
             feature_metadata = {}
         if all_column_names is None:
-            all_column_names = ["open", "high", "low", "close", "volume", "day", "id"]
+            all_column_names = list(US_EQUITY_PRICING_BCOLZ_COLUMNS)
 
         ctx = maybe_show_progress(
             (
@@ -277,12 +277,11 @@ class BcolzDailyBarWriter:
         assets : set[int], optional
             Set of expected asset IDs for validation.
         feature_metadata : dict[str, dict], optional
-            Unified metadata for custom features (collected in Pass 1). Stored in
-            the final table's attrs for later retrieval by the reader.
+            Pre-computed feature metadata from _compute_feature_metadata(). Stored
+            in the final table's attrs for later retrieval by the reader.
         all_column_names : list[str], optional
-            List of all column names from all assets (collected in Pass 1). Ensures
-            all assets have the same column structure, with missing columns filled
-            with zeros.
+            Ordered list of all column names in the final ctable. Ensures all assets
+            have the same column structure, with missing columns filled with zeros.
         
         Returns
         -------
@@ -294,8 +293,7 @@ class BcolzDailyBarWriter:
         last_row = {}
         calendar_offset = {}
 
-        # Initialize columns with all_column_names (collected in Pass 1)
-        # all columns must been converted to uint32 at to_ctable 
+        # Initialize columns — all must be converted to uint32 by to_ctable()
         columns = {}
         for colname in all_column_names:
             columns[colname] = carray(np.array([], dtype=uint32_dtype))
@@ -434,8 +432,8 @@ class BcolzDailyBarWriter:
         invalid_data_behavior : {'warn', 'raise', 'ignore'}
             How to handle data outside uint32 range after scaling.
         feature_metadata : dict[str, dict], optional
-            Unified metadata from Pass 1 (collected from all assets). If provided, this
-            metadata will be used for feature conversion. If None, features will not be processed.
+            Pre-computed feature metadata from _compute_feature_metadata(). Used for
+            feature encoding/scaling. If None, features will not be processed.
         
         Returns
         -------
@@ -537,7 +535,7 @@ class BcolzDailyBarWriter:
                 if encoding_map is None:
                     raise ValueError(
                         f"Feature '{feature_name}' is categorical but has no encoding_map. "
-                        "This should have been generated in Pass 1."
+                        "Ensure _compute_feature_metadata() was called before writing."
                     )
                 
                 feature_series = raw_data[feature_name]
