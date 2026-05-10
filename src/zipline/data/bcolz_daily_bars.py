@@ -13,7 +13,6 @@
 # limitations under the License.
 import warnings
 from functools import partial
-from itertools import tee
 
 with warnings.catch_warnings():  # noqa
     warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -169,386 +168,66 @@ class BcolzDailyBarWriter:
     def progress_bar_item_show_func(self, value):
         return value if value is None else str(value[0])
 
-    def _collect_batch_metadata(self, item):
-        """Process a single DataFrame to collect feature statistics.
-        
-        This method extracts metadata from custom features (non-OHLCV columns) in a DataFrame.
-        The collected metadata is used later to determine how features should be encoded,
-        scaled, and stored in the bcolz ctable.
-        
-        Metadata Extracted:
-        -------------------
-        For each custom feature, the following metadata is collected:
-        
-        1. **semantic_dtype**: 'numeric' or 'categorical'
-           - Determines whether the feature is treated as numeric or categorical data
-           - Example: 'pe' (float) -> 'numeric', 'sector' (string) -> 'categorical'
-        
-        2. **unique_values**: set of unique string values (categorical only)
-           - All distinct non-null values found in the feature
-           - Used to create encoding/decoding maps for categorical features
-           - Example: {'Technology', 'Finance', 'Healthcare'} for a 'sector' feature
-        
-        3. **is_integer**: bool (numeric only)
-           - Whether the feature's dtype is integer-based
-           - Determines if the feature should be scaled by *1000 or stored as raw uint32
-           - Example: volume-like features (int64) -> True, price-like features (float64) -> False
-        
-        4. **min_value**: float (numeric only)
-           - Minimum value found in the feature (excluding outliers)
-           - Outliers are excluded if abs(value) * 1000 > UINT32_MAX (for floats)
-           - Used to calculate negative_offset for preserving negative values
-           - Example: PB ratio with values [-2.5, 1.0, 3.5] -> min_value: -2.5
-        
-        Example:
-        --------
-        Input DataFrame with features:
-            date       | pe   | pb   | sector
-            -----------|------|------|--------
-            2020-01-01 | 15.5 | 2.3  | Tech
-            2020-01-02 | 16.0 | 2.5  | Tech
-            2020-01-03 | 14.5 | -1.2 | Finance
-        
-        Returns:
-            {
-                'column_names': {'date', 'pe', 'pb', 'sector'},
-                'feature_stats': {
-                    'pe': {
-                        'semantic_dtype': 'numeric',
-                        'is_integer': False,
-                        'min_value': 14.5,
-                        'unique_values': None
-                    },
-                    'pb': {
-                        'semantic_dtype': 'numeric',
-                        'is_integer': False,
-                        'min_value': -1.2,
-                        'unique_values': None
-                    },
-                    'sector': {
-                        'semantic_dtype': 'categorical',
-                        'unique_values': {'Tech', 'Finance'},
-                        'is_integer': None,
-                        'min_value': None
-                    }
-                }
-            }
-        
-        Parameters
-        ----------
-        item : tuple
-            Tuple of (sid, df) where df contains OHLCV + features.
-        
-        Returns
-        -------
-        partial_stats : dict
-            Dictionary with keys:
-            - 'column_names': set of column names (including OHLCV and features)
-            - 'feature_stats': dict mapping feature names to their statistics
-              Each feature's stats include: semantic_dtype, unique_values (categorical),
-              is_integer (numeric), min_value (numeric)
-        """
-        if len(item) != 2:
-            raise ValueError(f"Expected (sid, df) tuple, got: {item}")
-        
-        _, df = item
-        column_names = set(df.columns)
-        ohlcv_columns = {'open', 'high', 'low', 'close', 'volume'}
-        feature_columns = [col for col in df.columns if col not in ohlcv_columns]
-        
-        partial_feature_stats = {}
-        
-        for feature_name in feature_columns:
-            feature_series = df[feature_name]
-            dtype = feature_series.dtype
-            
-            # Detect categorical data using efficient dtype checks
-            is_object_dtype = (dtype == 'object' or dtype == object or 
-                             pd.api.types.is_object_dtype(dtype))
-            is_categorical_dtype = pd.api.types.is_categorical_dtype(dtype)
-            semantic_dtype = 'categorical' if (is_object_dtype or is_categorical_dtype) else 'numeric'
-            
-            stats = {
-                'semantic_dtype': semantic_dtype,
-                'unique_values': set() if semantic_dtype == 'categorical' else None,
-                'is_integer': None,
-                'min_value': None,
-            }
-            
-            if semantic_dtype == 'categorical':
-                # Extract unique values: convert to native Python strings for encoding_map consistency.
-                arr = feature_series.values
-                valid_mask = pd.notna(arr)
-                if valid_mask.any():
-                    unique_arr = np.unique(arr[valid_mask].astype(str))
-                    # Convert np.str_ to native str to match encoding_map keys in to_ctable.
-                    stats['unique_values'] = {str(val) for val in unique_arr}
-            else:
-                # Numeric processing: use numpy for faster operations
-                is_integer = pd.api.types.is_integer_dtype(dtype)
-                stats['is_integer'] = is_integer
-                
-                # Convert to numpy array for faster filtering and min calculation
-                arr = feature_series.values
-                valid_mask = pd.notna(arr)
-                
-                if valid_mask.any():
-                    valid_arr = arr[valid_mask]
-                    
-                    # Determine outlier threshold
-                    if is_integer:
-                        max_safe_abs_value = float(UINT32_MAX)
-                    else:
-                        max_safe_abs_value = UINT32_MAX / 1000.0
-                    
-                    # Use numpy for fast filtering and min calculation
-                    abs_valid = np.abs(valid_arr)
-                    in_range_mask = abs_valid <= max_safe_abs_value
-                    
-                    if in_range_mask.any():
-                        # Use numpy nanmin for safety (though we already filtered NaN)
-                        stats['min_value'] = float(np.nanmin(valid_arr[in_range_mask]))
-            
-            partial_feature_stats[feature_name] = stats
-        
-        return {
-            'column_names': column_names,
-            'feature_stats': partial_feature_stats
-        }
-
-    def _unify_feature_metadata(self, data_iter):
-        """Process DataFrames sequentially, merge statistics, and generate unified metadata.
-        
-        This method performs the complete workflow:
-        1. Processes all assets' DataFrames sequentially using _collect_batch_metadata
-        2. Merges partial statistics from all DataFrames
-        3. Generates final unified metadata dictionary for data conversion and storage
-        
-        Metadata Merging Strategy:
-        --------------------------
-        For each feature, partial statistics from all batches are merged using the following rules:
-        
-        **Categorical Features:**
-        - **unique_values**: Union of all unique values across all batches
-          Example: Batch1 has {'Tech', 'Finance'}, Batch2 has {'Tech', 'Healthcare'}
-          -> Merged: {'Tech', 'Finance', 'Healthcare'}
-        
-        **Numeric Features:**
-        - **is_integer**: AND operation - ALL batches must be integer, otherwise treated as float
-          If ANY batch has float dtype, the feature is marked as float (requiring scaling)
-          Example: Batch1 (int64), Batch2 (float64) -> is_integer: False (treated as float)
-          Example: Batch1 (int64), Batch2 (int64) -> is_integer: True (no scaling needed)
-        - **min_value**: Minimum value across ALL batches (excluding outliers)
-          Example: Batch1 min=-2.5, Batch2 min=-1.0 -> Merged min: -2.5
-        
-        Final Metadata Generation:
-        -------------------------
-        After merging all batch statistics, final metadata is generated:
-        
-        **For Categorical Features:**
-        - Creates encoding_map: string -> uint32 (1-indexed, 0 reserved for NaN)
-          Example: {'Tech': 1, 'Finance': 2, 'Healthcare': 3}
-        - Creates decoding_map: uint32 -> string (reverse mapping)
-          Example: {1: 'Tech', 2: 'Finance', 3: 'Healthcare', 0: None}
-        
-        **For Numeric Features:**
-        - **scale_with_thousand**: False if is_integer=True, True otherwise
-          Determines if values should be scaled by *1000 before uint32 conversion
-        - **negative_offset**: Calculated as -min_value if min_value < 0, else 0.0
-          Used to shift negative values into uint32 range (offset added during write,
-          subtracted during read to restore original negative values)
-          Example: min_value=-2.5 -> negative_offset=2.5
-        
-        Example:
-        --------
-        Batch 1 (Asset A): pb feature with values [1.5, 2.0, -1.2]
-        Batch 2 (Asset B): pb feature with values [3.0, 2.5, -0.5]
-        
-        Merged statistics:
-            - semantic_dtype: 'numeric'
-            - is_integer: False
-            - min_value: -1.2 (minimum across all batches)
-        
-        Final metadata:
-            - dtype: 'uint32'
-            - semantic_dtype: 'numeric'
-            - scale_with_thousand: True
-            - negative_offset: 1.2
-        
-        Why Sequential Processing?
-        --------------------------
-        We use sequential processing instead of parallel processing for the following reasons:
-        - Generator memory efficiency: Parallel processing requires converting the generator
-          to a list (list(data_iter)), which loads all DataFrames into memory at once,
-          defeating the memory-efficient nature of generators.
-        - Serialization overhead: Parallel processing requires pickling DataFrames for
-          inter-process communication, which is expensive for large DataFrames.
-        - Process creation cost: For small datasets, the overhead of creating worker
-          processes outweighs the benefits of parallelization.
-        - Sequential processing maintains the generator's lazy evaluation benefits,
-          processing one DataFrame at a time with minimal memory footprint.
-        
-        Parameters
-        ----------
-        data_iter : iterable
-            Iterator yielding (sid, df) tuples where df contains OHLCV + features.
-        
-        Returns
-        -------
-        unified_metadata : dict
-            Dictionary mapping feature names to their metadata.
-            Each feature's metadata includes:
-            - 'dtype': Storage dtype (always 'uint32')
-            - 'semantic_dtype': 'numeric' or 'categorical'
-            - For categorical: 'encoding_map' and 'decoding_map'
-            - For numeric: 'scale_with_thousand' and 'negative_offset'
-        all_column_names_set : set
-            Set containing all column names collected across all assets.
-        """
-        # Step 1: Process DataFrames sequentially and collect statistics
-        feature_stats = {}
-        all_column_names_set = set()
-        
-        for item in data_iter:
-            # Process single DataFrame to collect partial statistics
-            result = self._collect_batch_metadata(item)
-            
-            # Merge column names
-            all_column_names_set.update(result['column_names'])
-            
-            # Merge feature statistics
-            for feature_name, partial_stats in result['feature_stats'].items():
-                if feature_name not in feature_stats:
-                    # First encounter: use partial stats as-is
-                    feature_stats[feature_name] = partial_stats.copy()
-                else:
-                    # Merge with existing stats
-                    existing = feature_stats[feature_name]
-                    
-                    # Merge unique_values (for categorical)
-                    if existing['unique_values'] is not None and partial_stats['unique_values'] is not None:
-                        existing['unique_values'].update(partial_stats['unique_values'])
-                    
-                    # Update is_integer flag: if ANY batch is float, mark as float (not integer)
-                    # This ensures mixed int/float batches are treated as float (requiring scaling)
-                    # Logic: ALL batches must be integer to be treated as integer
-                    partial_is_integer = partial_stats.get('is_integer')
-                    if partial_is_integer is False:
-                        # If this batch is float, the feature must be treated as float
-                        existing['is_integer'] = False
-                    elif partial_is_integer is True:
-                        # Only keep True if we haven't seen a float batch yet
-                        # If existing is already False (from a previous float batch), keep it False
-                        if existing.get('is_integer') is not False:
-                            existing['is_integer'] = True
-                    
-                    # Update min_value (take minimum across all batches)
-                    partial_min = partial_stats.get('min_value')
-                    if partial_min is not None:
-                        if existing['min_value'] is None:
-                            existing['min_value'] = partial_min
-                        else:
-                            existing['min_value'] = min(existing['min_value'], partial_min)
-        
-        # Step 2: Generate unified metadata from merged statistics
-        unified_metadata = {}
-        for feature_name, stats in feature_stats.items():
-            semantic_dtype = stats.get('semantic_dtype', 'numeric')
-            is_categorical = (semantic_dtype == 'categorical')
-            
-            metadata = {
-                'dtype': 'uint32',
-                'semantic_dtype': semantic_dtype,
-            }
-            
-            if is_categorical:
-                # Create encoding/decoding maps: convert all values to strings for consistency.
-                # This ensures encoding_map keys match astype(str) results in to_ctable.
-                unique_values = stats.get('unique_values', set())
-                if unique_values:
-                    sorted_values = sorted(str(val) for val in unique_values)
-                    encoding_map = {val: idx + 1 for idx, val in enumerate(sorted_values)}
-                    decoding_map = {idx + 1: val for idx, val in enumerate(sorted_values)}
-                    decoding_map[0] = None  # 0 reserved for NaN
-                    
-                    metadata['encoding_map'] = encoding_map
-                    metadata['decoding_map'] = decoding_map
-            else:
-                # Numeric features: integers are stored without scaling
-                metadata['scale_with_thousand'] = not bool(stats.get('is_integer', False))
-                min_value = stats.get('min_value')
-                if min_value is not None and pd.notna(min_value) and min_value < 0:
-                    metadata['negative_offset'] = float(-min_value)
-                else:
-                    metadata['negative_offset'] = 0.0
-            
-            unified_metadata[feature_name] = metadata
-        
-        return unified_metadata, all_column_names_set
-
     def write(
-        self, data, assets=None, show_progress=False, invalid_data_behavior="warn"
+        self,
+        data,
+        assets=None,
+        show_progress=False,
+        invalid_data_behavior="warn",
+        feature_metadata=None,
+        all_column_names=None,
     ):
         """Write OHLCV data and optional custom features to bcolz ctable.
 
         Parameters
         ----------
         data : iterable[tuple[int, pandas.DataFrame]]
-            The data chunks to write. Each chunk should be a tuple of:
-            - (sid, df) where df contains OHLCV columns (open, high, low, close, volume)
-              and optionally custom feature columns. All columns must have the same length
-              and be aligned with the same date index.
+            The data chunks to write. Each chunk should be a tuple of
+            (sid, df) where df contains OHLCV columns and optionally custom
+            feature columns.
         assets : set[int], optional
-            The assets that should be in ``data``. If this is provided
-            we will check ``data`` against the assets and provide better
-            progress information.
+            Expected asset IDs for validation and progress reporting.
         show_progress : bool, optional
-            Whether or not to show a progress bar while writing.
+            Whether to show a progress bar while writing.
         invalid_data_behavior : {'warn', 'raise', 'ignore'}, optional
-            What to do when data is encountered that is outside the range of
-            a uint32.
+            What to do when data falls outside the uint32 range.
+        feature_metadata : dict, optional
+            Pre-computed feature metadata from duckdbdir._compute_feature_metadata().
+            Keys are feature column names; values are dicts with 'dtype',
+            'semantic_dtype', and either encoding/decoding maps (categorical)
+            or scale_with_thousand / negative_offset (numeric).
+            Defaults to {} (OHLCV-only bundle).
+        all_column_names : list[str], optional
+            Ordered list of all column names in the final ctable.
+            Must start with the standard OHLCV+day+id prefix.
+            Defaults to ['open', 'high', 'low', 'close', 'volume', 'day', 'id'].
 
         Returns
         -------
         table : bcolz.ctable
-            The newly-written table with OHLCV and feature columns. 
+            The newly-written table.
         """
-        # Data is in (sid, df) format from factory functions (duckdbdir, csvdir)
-        # df contains OHLCV + Features in a single DataFrame
-        # data is a generator (original Zipline pattern)
-        
-        # Use itertools.tee() to split iterator for two passes
-        # This allows us to iterate twice while maintaining the original generator pattern
-        data_iter1, data_iter2 = tee(data, 2)
-        
-        # Pass 1: Process DataFrames sequentially, merge statistics, and generate unified metadata
-        unified_metadata, all_column_names_set = self._unify_feature_metadata(data_iter1)
-        
-        # Convert collected column names to sorted list (OHLCV first, then features)
-        # Note: 'day' and 'id' are added by to_ctable(), so they're not in all_column_names_set yet
-        # But we know they will be present in all ctables, so we include them
-        ohlcv_list = ['open', 'high', 'low', 'close', 'volume', 'day', 'id']
-        feature_list = sorted([col for col in all_column_names_set if col not in {'open', 'high', 'low', 'close', 'volume'}])
-        all_column_names = ohlcv_list + feature_list
-        
-        # Pass 2: Create Ctable for each asset with unified metadata
-        # unified_metadata is column-based (not asset-based), so it applies to all assets
-        # to_ctable will automatically use the metadata for features present in the DataFrame
+        if feature_metadata is None:
+            feature_metadata = {}
+        if all_column_names is None:
+            all_column_names = ["open", "high", "low", "close", "volume", "day", "id"]
+
         ctx = maybe_show_progress(
-            ((sid, self.to_ctable(df, invalid_data_behavior, feature_metadata=unified_metadata)) 
-             for sid, df in data_iter2),
+            (
+                (sid, self.to_ctable(df, invalid_data_behavior, feature_metadata=feature_metadata))
+                for sid, df in data
+            ),
             show_progress=show_progress,
             item_show_func=self.progress_bar_item_show_func,
             label=self.progress_bar_message,
             length=len(assets) if assets is not None else None,
         )
-        
         with ctx as it:
             return self._write_internal(
-                it, 
-                assets, 
-                feature_metadata=unified_metadata,  # Pass unified metadata (from all assets)
-                all_column_names=all_column_names  # Pass all column names
+                it,
+                assets,
+                feature_metadata=feature_metadata,
+                all_column_names=all_column_names,
             )
 
     def write_csvs(self, asset_map, show_progress=False, invalid_data_behavior="warn"):

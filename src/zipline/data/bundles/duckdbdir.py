@@ -62,6 +62,19 @@ _OHLCV_COLS: frozenset[str] = frozenset(
     {"symbol", "date", "open", "high", "low", "close", "volume"}
 )
 
+_UINT32_MAX: int = int(np.iinfo(np.uint32).max)  # 4_294_967_295
+
+# DuckDB base types that map to pandas integer dtypes (pd.api.types.is_integer_dtype → True).
+_DUCKDB_INTEGER_DTYPES: frozenset[str] = frozenset({
+    "TINYINT", "INT1", "SMALLINT", "INT2", "INTEGER", "INT4", "INT",
+    "BIGINT", "INT8", "HUGEINT", "UBIGINT", "UINTEGER", "USMALLINT",
+    "UTINYINT", "SIGNED",
+})
+# DuckDB base types that represent string/categorical data.
+_DUCKDB_CATEGORICAL_DTYPES: frozenset[str] = frozenset({
+    "VARCHAR", "TEXT", "CHAR", "BPCHAR", "STRING",
+})
+
 
 # ---------------------------------------------------------------------------
 # Public factory
@@ -143,6 +156,92 @@ def duckdb_equities(
 
 _SUPPORTED_TFRAMES: frozenset[str] = frozenset({"daily", "minute"})
 
+_OHLCV_WRITE_COLS: list[str] = ["open", "high", "low", "close", "volume", "day", "id"]
+
+
+def _compute_feature_metadata(
+    conn: duckdb.DuckDBPyConnection,
+    schema: str,
+    table: str,
+    feature_cols: list[str],
+) -> dict:
+    """Compute feature metadata via DuckDB aggregate queries.
+
+    Replaces the two-pass itertools.tee + BcolzDailyBarWriter._unify_feature_metadata()
+    pattern.  A single aggregate query covers all numeric columns; one DISTINCT query
+    runs per categorical column.  The returned dict matches _unify_feature_metadata()'s
+    output format exactly so BcolzDailyBarWriter.write() is unchanged beyond accepting
+    it as a parameter.
+
+    Equivalence guarantees vs the tee / Python path:
+    - is_integer: DuckDB schema enforces a single dtype per column, so the global
+      dtype check is equivalent to the per-symbol AND aggregation.
+    - min_value: global MIN across all rows equals min-of-per-symbol-mins.
+    - outlier filter (abs(v) > UINT32_MAX for int, > UINT32_MAX/1000 for float):
+      reproduced via a CASE expression; NULLs are skipped by MIN() automatically.
+    - categorical unique_values: DISTINCT is equivalent to the union of per-symbol
+      np.unique sets.
+    """
+    if not feature_cols:
+        return {}
+
+    describe_rows = conn.execute(f"DESCRIBE {schema}.{table}").fetchall()
+    col_dtypes: dict[str, str] = {row[0]: row[1].upper() for row in describe_rows}
+
+    numeric_cols: list[str] = []
+    categorical_cols: list[str] = []
+    for col in feature_cols:
+        base = col_dtypes.get(col, "DOUBLE").split("(")[0].strip()
+        if base in _DUCKDB_CATEGORICAL_DTYPES:
+            categorical_cols.append(col)
+        else:
+            numeric_cols.append(col)
+
+    metadata: dict[str, dict] = {}
+
+    if numeric_cols:
+        is_integer: dict[str, bool] = {
+            col: col_dtypes.get(col, "DOUBLE").split("(")[0].strip() in _DUCKDB_INTEGER_DTYPES
+            for col in numeric_cols
+        }
+        # One aggregate query: global MIN per column with outlier filter.
+        # CASE … END returns NULL for out-of-range values; MIN() ignores NULLs.
+        min_clauses = [
+            'MIN(CASE WHEN ABS("{col}") <= {threshold} THEN "{col}" END) AS "{col}__min"'.format(
+                col=col,
+                threshold=_UINT32_MAX if is_integer[col] else _UINT32_MAX / 1000.0,
+            )
+            for col in numeric_cols
+        ]
+        row = conn.execute(f'SELECT {", ".join(min_clauses)} FROM {schema}.{table}').fetchone()
+        for i, col in enumerate(numeric_cols):
+            min_val = row[i]
+            negative_offset = float(-min_val) if (min_val is not None and min_val < 0) else 0.0
+            metadata[col] = {
+                "dtype": "uint32",
+                "semantic_dtype": "numeric",
+                "scale_with_thousand": not is_integer[col],
+                "negative_offset": negative_offset,
+            }
+
+    for col in categorical_cols:
+        rows = conn.execute(
+            f'SELECT DISTINCT "{col}" FROM {schema}.{table}'
+            f' WHERE "{col}" IS NOT NULL ORDER BY "{col}"'
+        ).fetchall()
+        unique_values = [str(r[0]) for r in rows]
+        encoding_map = {val: idx + 1 for idx, val in enumerate(unique_values)}
+        decoding_map: dict[int, str | None] = {idx + 1: val for idx, val in enumerate(unique_values)}
+        decoding_map[0] = None
+        metadata[col] = {
+            "dtype": "uint32",
+            "semantic_dtype": "categorical",
+            "encoding_map": encoding_map,
+            "decoding_map": decoding_map,
+        }
+
+    return metadata
+
 
 def _ingest_bundle(
     conn: duckdb.DuckDBPyConnection,
@@ -198,7 +297,20 @@ def _ingest_bundle(
         ),
     }
     for tframe in tframes:
-        writers[tframe].write(pricing_iters[tframe](), show_progress=show_progress)
+        if tframe == "daily" and feature_cols:
+            feature_metadata = _compute_feature_metadata(
+                conn, schema, "ohlcv_features", feature_cols
+            )
+            all_column_names = _OHLCV_WRITE_COLS + sorted(feature_cols)
+        else:
+            feature_metadata = {}
+            all_column_names = _OHLCV_WRITE_COLS[:]
+        writers[tframe].write(
+            pricing_iters[tframe](),
+            show_progress=show_progress,
+            feature_metadata=feature_metadata,
+            all_column_names=all_column_names,
+        )
 
     # 2. Write asset metadata.
     _write_assets(conn, schema, symbols, symbol_to_sid, calendar, asset_db_writer)
