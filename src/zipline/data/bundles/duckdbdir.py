@@ -327,13 +327,20 @@ def _ingest_bundle(
         else:
             feature_metadata = {}
             all_column_names = list(_OHLCV_WRITE_COLS)
-        batch_size = _DAILY_BATCH_SIZE if tframe == "daily" else _MINUTE_BATCH_SIZE
-        writers[tframe].write(
-            pricing_iters[tframe](),
-            show_progress=show_progress,
-            feature_metadata=feature_metadata,
-            all_column_names=all_column_names,
-        )
+        if tframe == "daily":
+            writers[tframe].write(
+                pricing_iters[tframe](),
+                show_progress=show_progress,
+                feature_metadata=feature_metadata,
+                all_column_names=all_column_names,
+            )
+        else:
+            # BcolzMinuteBarWriter.write() does not accept feature_metadata /
+            # all_column_names — minute staging tables carry no feature cols.
+            writers[tframe].write(
+                pricing_iters[tframe](),
+                show_progress=show_progress,
+            )
 
     # 2. Write asset metadata.
     _write_assets(conn, schema, symbols, symbol_to_sid, calendar, asset_db_writer)
@@ -369,6 +376,8 @@ def _emit_batch(
     to the per-symbol path.
     """
     batch_syms = [sym for _, sym in batch]
+    if not batch_syms:
+        return
     ph = ", ".join("?" * len(batch_syms))
     df_all = conn.execute(
         f"SELECT symbol, {cols_sql} FROM {schema}.{table}"
