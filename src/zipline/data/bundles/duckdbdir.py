@@ -542,7 +542,7 @@ def _read_ratio_table(
     if rows.empty:
         return empty
     rows["sid"] = rows["symbol"].map(symbol_to_sid).astype("int64")
-    rows[date_col] = _to_epoch_days(rows[date_col])
+    rows[date_col] = _to_epoch_seconds(rows[date_col])
     return rows[["sid", "ratio", date_col]].reset_index(drop=True)
 
 
@@ -580,7 +580,7 @@ def _read_dividends(
         return empty
     rows["sid"] = rows["symbol"].map(symbol_to_sid).astype("int64")
     for dcol in ("ex_date", "declared_date", "record_date", "pay_date"):
-        rows[dcol] = _to_epoch_days(rows[dcol], fill_null=0)
+        rows[dcol] = _to_epoch_seconds(rows[dcol], fill_null=0)
 
     return rows[
         ["sid", "amount", "ex_date", "declared_date", "record_date", "pay_date"]
@@ -592,8 +592,13 @@ def _read_dividends(
 # ---------------------------------------------------------------------------
 
 
-def _to_epoch_days(series: pd.Series, fill_null: int = 0) -> pd.Series:
-    """Convert a date column to integer epoch days (NaT / NULL → fill_null)."""
+def _to_epoch_seconds(series: pd.Series, fill_null: int = 0) -> pd.Series:
+    """Convert a date column to integer epoch seconds (NaT / NULL → fill_null).
+
+    SQLiteAdjustmentWriter.write_frame stores effective_date as epoch seconds,
+    and get_adjustments_for_sid reads it back as pd.Timestamp(val, unit="s").
+    Must be seconds, not days.
+    """
     dt = pd.to_datetime(series, errors="coerce").dt.normalize()
-    days = (dt - pd.Timestamp("1970-01-01")) / pd.Timedelta("1D")
-    return days.fillna(fill_null).astype("int64")
+    secs = (dt - pd.Timestamp("1970-01-01")) / pd.Timedelta("1s")
+    return secs.fillna(fill_null).astype("int64")
