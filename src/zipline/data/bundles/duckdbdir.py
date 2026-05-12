@@ -3,46 +3,53 @@
 Replaces hdfdir.py.  Reads directly from fyan_computed.duckdb staging tables
 (materialised by Compute Engine R1–R6) — no intermediate file format.
 
+Bundle = timeframe: each registered bundle covers exactly one timeframe (daily
+OR minute).  Both timeframes use the same output table name ``ohlcv_features``
+inside the bundle schema — the ``date`` column type (DATE vs TIMESTAMP UTC)
+distinguishes them.  Mixing daily and minute in a single bundle is not supported.
+
 Registration examples (in Fyan's engine/bundle.py via _isolation.py):
 
     # Daily US equities — NYSE calendar
     bundles.register(
-        "us_equities",
+        "sharadar_daily",
         duckdb_equities("/path/to/fyan_computed.duckdb"),
         calendar_name="NYSE",
     )
 
-    # Daily crypto (Upbit) — 24/7 AlwaysOpenCalendar
+    # Minute US equities (NYSE, 390 min/day)
     bundles.register(
-        "upbit_daily",
-        duckdb_equities("/path/to/fyan_computed.duckdb"),
-        calendar_name="24/7",
+        "alpaca_1m",
+        duckdb_equities(
+            "/path/to/fyan_computed.duckdb",
+            tframes=("minute",),
+        ),
+        calendar_name="NYSE",
+        minutes_per_day=390,
     )
 
-    # Minute crypto (Upbit 1-min) — 24/7, 1440 min/day
+    # Minute crypto (Upbit) — 24/7 AlwaysOpenCalendar, 1440 min/day
     bundles.register(
         "upbit_1m",
         duckdb_equities(
             "/path/to/fyan_computed.duckdb",
-            tframes=("daily", "minute"),
-            minute_table="ohlcv_minute",
+            tframes=("minute",),
         ),
         calendar_name="24/7",
-        minutes_per_day=1440,   # AlwaysOpenCalendar: 1440 min/session, NOT 390
+        minutes_per_day=1440,
     )
 
 If duckdb_path is omitted the ingester falls back to the FYAN_COMPUTED_PATH
 env-var, which the Compute Engine sets on the subprocess.  FYAN_BUNDLE_NAME
 selects the staging schema (<bundle_name>.*) to read.
 
-Staging table contracts
------------------------
-Daily:  <bundle>.ohlcv_features  — columns: symbol, date (DATE), open, high, low,
-                                    close, volume (all float64), + optional feature cols
-Minute: <bundle>.ohlcv_minute    — columns: symbol, date (TIMESTAMP UTC), open, high,
-                                    low, close, volume (all float64); no feature cols
-Both tables use the canonical column name "date" for the time axis regardless of grain.
-Timezone: minute timestamps must be UTC-naive or UTC-aware; the ingester normalises both.
+Staging table contract (both timeframes)
+-----------------------------------------
+<bundle>.ohlcv_features — columns: symbol, date, open, high, low, close, volume
+                           (all float64), + optional feature cols (daily only).
+  Daily:  date is DATE.
+  Minute: date is TIMESTAMP UTC (UTC-naive or UTC-aware; ingester normalises both).
+The canonical column name "date" is used for the time axis regardless of grain.
 """
 
 from __future__ import annotations
@@ -86,7 +93,6 @@ def duckdb_equities(
     duckdb_path: str | None = None,
     tframes: tuple[str, ...] = ("daily",),
     calendar_name: str = "NYSE",
-    minute_table: str = "ohlcv_minute",
 ):
     """Curried factory.  Returns the bound ingest callable zipline will invoke.
 
@@ -96,14 +102,11 @@ def duckdb_equities(
         Absolute path to fyan_computed.duckdb.  Falls back to
         ``os.environ["FYAN_COMPUTED_PATH"]`` if not supplied.
     tframes:
-        Subset of ``{"daily", "minute"}`` to ingest.  Default is ``("daily",)``.
-        For minute support register with ``minutes_per_day`` matching the calendar
-        (e.g. 1440 for ``"24/7"``, 390 for ``"NYSE"``).
+        One of ``("daily",)`` or ``("minute",)``.  A bundle covers exactly one
+        timeframe.  For minute, set ``minutes_per_day`` on ``bundles.register()``
+        to match the calendar (390 for NYSE, 1440 for 24/7).
     calendar_name:
         Trading calendar (forwarded to bundles.register at registration site).
-    minute_table:
-        Name of the staging table holding minute OHLCV inside the bundle schema.
-        Default ``"ohlcv_minute"``.  Ignored when ``"minute"`` not in *tframes*.
     """
 
     def ingest(
@@ -143,7 +146,6 @@ def duckdb_equities(
                 minute_bar_writer=minute_bar_writer,
                 asset_db_writer=asset_db_writer,
                 adjustment_writer=adjustment_writer,
-                minute_table=minute_table,
                 show_progress=show_progress,
             )
 
@@ -272,7 +274,6 @@ def _ingest_bundle(
     minute_bar_writer,
     asset_db_writer,
     adjustment_writer,
-    minute_table: str,
     show_progress: bool,
 ) -> None:
     schema = bundle_name
@@ -283,28 +284,23 @@ def _ingest_bundle(
             f"duckdbdir: unsupported tframes {unknown!r}; supported: {sorted(_SUPPORTED_TFRAMES)}"
         )
 
-    # Primary table drives symbol discovery and feature-column enumeration.
-    # When both daily and minute are requested, daily is primary (features live there).
-    primary_table = "ohlcv_features" if "daily" in tframes else minute_table
-
-    describe_rows = conn.execute(f"DESCRIBE {schema}.{primary_table}").fetchall()
+    # Both daily and minute bundles read from ohlcv_features.
+    # The date column type (DATE vs TIMESTAMP UTC) distinguishes the timeframe.
+    describe_rows = conn.execute(f"DESCRIBE {schema}.ohlcv_features").fetchall()
     all_cols = [row[0] for row in describe_rows]
     feature_cols = [c for c in all_cols if c not in _OHLCV_COLS]
 
     # Stable sid assignment: sorted symbol order, same as asset metadata below.
     symbol_rows = conn.execute(
-        f"SELECT DISTINCT symbol FROM {schema}.{primary_table} ORDER BY symbol"
+        f"SELECT DISTINCT symbol FROM {schema}.ohlcv_features ORDER BY symbol"
     ).fetchall()
     symbols: list[str] = [r[0] for r in symbol_rows]
     if not symbols:
-        raise ValueError(f"No symbols found in {schema}.{primary_table}")
+        raise ValueError(f"No symbols found in {schema}.ohlcv_features")
 
     symbol_to_sid: dict[str, int] = {sym: i for i, sym in enumerate(symbols)}
 
     # 1. Write pricing data — dispatch per tframe.
-    # Both daily and minute share _pricing_iter; the table name and feature_cols differ.
-    # Minute staging table contract: (symbol, date TIMESTAMP UTC, open, high, low, close, volume)
-    # "date" column name is canonical regardless of grain (same as transformer R6 output).
     writers = {"daily": daily_bar_writer, "minute": minute_bar_writer}
     pricing_iters = {
         "daily": lambda: _pricing_iter(
@@ -313,7 +309,7 @@ def _ingest_bundle(
             batch_size=_DAILY_BATCH_SIZE,
         ),
         "minute": lambda: _pricing_iter(
-            conn, schema, minute_table, symbols, [], show_progress,
+            conn, schema, "ohlcv_features", symbols, [], show_progress,
             label="Loading minute pricing data: ",
             batch_size=_MINUTE_BATCH_SIZE,
         ),
