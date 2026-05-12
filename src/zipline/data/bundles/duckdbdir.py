@@ -92,7 +92,6 @@ _DUCKDB_CATEGORICAL_DTYPES: frozenset[str] = frozenset({
 def duckdb_equities(
     duckdb_path: str | None = None,
     tframes: tuple[str, ...] = ("daily",),
-    calendar_name: str = "NYSE",
 ):
     """Curried factory.  Returns the bound ingest callable zipline will invoke.
 
@@ -103,10 +102,8 @@ def duckdb_equities(
         ``os.environ["FYAN_COMPUTED_PATH"]`` if not supplied.
     tframes:
         One of ``("daily",)`` or ``("minute",)``.  A bundle covers exactly one
-        timeframe.  For minute, set ``minutes_per_day`` on ``bundles.register()``
-        to match the calendar (390 for NYSE, 1440 for 24/7).
-    calendar_name:
-        Trading calendar (forwarded to bundles.register at registration site).
+        timeframe.  For minute, also set ``minutes_per_day`` on
+        ``bundles.register()`` to match the calendar (390 for NYSE, 1440 for 24/7).
     """
 
     def ingest(
@@ -332,7 +329,7 @@ def _ingest_bundle(
             )
         else:
             # BcolzMinuteBarWriter.write() does not accept feature_metadata /
-            # all_column_names — minute staging tables carry no feature cols.
+            # all_column_names — minute bundles carry no feature cols.
             writers[tframe].write(
                 pricing_iters[tframe](),
                 show_progress=show_progress,
@@ -408,9 +405,9 @@ def _pricing_iter(
 ) -> Generator[tuple[int, pd.DataFrame], None, None]:
     """Yield (sid, df) for each symbol from <schema>.<table>.
 
-    Works for both daily (ohlcv_features, DATE "date" column) and minute
-    (ohlcv_minute, TIMESTAMP UTC "date" column) staging tables — the "date"
-    column name is canonical regardless of grain (transformer R6 contract).
+    Works for both daily (DATE "date" column) and minute (TIMESTAMP UTC "date"
+    column) bundles — both read from ohlcv_features; the "date" column name is
+    canonical regardless of grain (transformer R6 contract).
 
     When batch_size > 1, symbols are fetched in batches via IN-list queries
     (_emit_batch), reducing DuckDB round-trip overhead (~4.4x at batch_size=64
