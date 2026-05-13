@@ -54,8 +54,10 @@ The canonical column name "date" is used for the time axis regardless of grain.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import sys
 from typing import Final, Generator
 
 import duckdb
@@ -286,6 +288,8 @@ def _ingest_bundle(
     describe_rows = conn.execute(f"DESCRIBE {schema}.ohlcv_features").fetchall()
     all_cols = [row[0] for row in describe_rows]
     feature_cols = [c for c in all_cols if c not in _OHLCV_COLS]
+    # Strip compute-identity columns — not data features for zipline.
+    feature_cols = [c for c in feature_cols if c not in {"config_hash", "created_by"}]
 
     # Stable sid assignment: sorted symbol order, same as asset metadata below.
     symbol_rows = conn.execute(
@@ -418,6 +422,13 @@ def _pricing_iter(
     if feature_cols:
         cols_sql += ", " + ", ".join(feature_cols)
 
+    total = len(symbols)
+    # Emit structured JSON progress so the Fyan orchestrator (subprocess.PIPE, not a TTY)
+    # can forward per-symbol progress to the web UI via SSE.  click.progressbar is also
+    # active when show_progress=True on a real TTY — both paths coexist without conflict.
+    print(json.dumps({"type": "ingest_progress", "current": 0, "total": total, "symbol": ""}),
+          flush=True, file=sys.stdout)
+
     with maybe_show_progress(symbols, show_progress, label=label) as it:
         if batch_size <= 1:
             for sid, symbol in enumerate(it):
@@ -439,6 +450,10 @@ def _pricing_iter(
                     if dates.dt.tz is not None
                     else dates.dt.tz_localize("UTC")
                 )
+                if sid % 50 == 0 or sid == total - 1:
+                    print(json.dumps({"type": "ingest_progress", "current": sid + 1,
+                                      "total": total, "symbol": symbol}),
+                          flush=True, file=sys.stdout)
                 yield sid, df.set_index("date")
         else:
             pending: list[tuple[int, str]] = []
@@ -446,9 +461,17 @@ def _pricing_iter(
                 pending.append((sid, symbol))
                 if len(pending) >= batch_size:
                     yield from _emit_batch(conn, schema, table, cols_sql, pending)
+                    last_sid, last_sym = pending[-1]
+                    print(json.dumps({"type": "ingest_progress", "current": last_sid + 1,
+                                      "total": total, "symbol": last_sym}),
+                          flush=True, file=sys.stdout)
                     pending = []
             if pending:
                 yield from _emit_batch(conn, schema, table, cols_sql, pending)
+                last_sid, last_sym = pending[-1]
+                print(json.dumps({"type": "ingest_progress", "current": last_sid + 1,
+                                  "total": total, "symbol": last_sym}),
+                      flush=True, file=sys.stdout)
 
 
 # ---------------------------------------------------------------------------

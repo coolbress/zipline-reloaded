@@ -480,7 +480,9 @@ class BcolzDailyBarWriter:
         # Check all numeric columns (OHLC + numeric features + volume) together
         # Same as original Zipline: winsorise_uint32(raw_data, invalid_data_behavior, "volume", *OHLC)
         all_numeric_columns = all_scaled_columns + numeric_feature_columns_no_scale + ["volume"]
-        numeric_subset = raw_data[all_numeric_columns].to_numpy(copy=True)
+        # astype(float) converts pandas nullable-int NA → NaN before winsorise_uint32's
+        # `data[:, col_idx] > UINT32_MAX` comparison; avoids "boolean value of NA is ambiguous".
+        numeric_subset = raw_data[all_numeric_columns].astype(float).to_numpy(copy=True)
         
         # Apply negative offsets vectorized (faster than loop)
         if feature_offsets:
