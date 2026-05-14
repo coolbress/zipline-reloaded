@@ -303,6 +303,11 @@ def _ingest_bundle(
     if not symbols:
         raise ValueError(f"No symbols found in {schema}.ohlcv_features")
 
+    # FYAN_INGEST_LIMIT: limit universe for profiling/dev runs (0 = no limit).
+    _limit = int(os.environ.get("FYAN_INGEST_LIMIT", "0") or "0")
+    if _limit > 0:
+        symbols = symbols[:_limit]
+
     symbol_to_sid: dict[str, int] = {sym: i for i, sym in enumerate(symbols)}
 
     # 1. Write pricing data — dispatch per tframe.
