@@ -58,7 +58,11 @@ import json
 import logging
 import os
 import sys
+import time
 from typing import Final, Generator
+
+# Set FYAN_PROFILE=1 to emit {"type":"ingest_timing",...} summary on stdout.
+_PROFILE: bool = os.environ.get("FYAN_PROFILE") == "1"
 
 import duckdb
 import numpy as np
@@ -371,16 +375,31 @@ def _emit_batch(
     overhead significantly (~4.4x for N=64 on daily data).  Results are split
     by symbol via groupby before yielding so the caller interface is identical
     to the per-symbol path.
+
+    When FYAN_PROFILE=1 the DuckDB fetch wall-time is emitted as a JSON event
+    so the caller can separate I/O cost from bcolz write cost.
     """
     batch_syms = [sym for _, sym in batch]
     if not batch_syms:
         return
     ph = ", ".join("?" * len(batch_syms))
+
+    t_fetch = time.perf_counter()
     df_all = conn.execute(
         f"SELECT symbol, {cols_sql} FROM {schema}.{table}"
         f" WHERE symbol IN ({ph}) ORDER BY symbol, date",
         batch_syms,
     ).df()
+    fetch_ms = (time.perf_counter() - t_fetch) * 1000
+
+    if _PROFILE:
+        print(json.dumps({
+            "type": "batch_fetch",
+            "batch_size": len(batch_syms),
+            "rows": len(df_all),
+            "fetch_ms": round(fetch_ms, 1),
+        }), flush=True, file=sys.stdout)
+
     sym_groups = {
         sym: grp.drop(columns=["symbol"])
         for sym, grp in df_all.groupby("symbol", sort=False)
@@ -457,21 +476,47 @@ def _pricing_iter(
                 yield sid, df.set_index("date")
         else:
             pending: list[tuple[int, str]] = []
+            t_iter_start = time.perf_counter()
+            total_batch_ms: float = 0.0  # wall-time of each yield-from block (fetch + write)
+            n_batches: int = 0
+
+            def _run_batch(batch: list[tuple[int, str]]) -> Generator:
+                nonlocal total_batch_ms, n_batches
+                t0 = time.perf_counter()
+                yield from _emit_batch(conn, schema, table, cols_sql, batch)
+                # Time measured AFTER all yields are consumed by the caller (bcolz writes done).
+                total_batch_ms += (time.perf_counter() - t0) * 1000
+                n_batches += 1
+
             for sid, symbol in enumerate(it):
                 pending.append((sid, symbol))
                 if len(pending) >= batch_size:
-                    yield from _emit_batch(conn, schema, table, cols_sql, pending)
+                    yield from _run_batch(pending)
                     last_sid, last_sym = pending[-1]
                     print(json.dumps({"type": "ingest_progress", "current": last_sid + 1,
                                       "total": total, "symbol": last_sym}),
                           flush=True, file=sys.stdout)
                     pending = []
             if pending:
-                yield from _emit_batch(conn, schema, table, cols_sql, pending)
+                yield from _run_batch(pending)
                 last_sid, last_sym = pending[-1]
                 print(json.dumps({"type": "ingest_progress", "current": last_sid + 1,
                                   "total": total, "symbol": last_sym}),
                       flush=True, file=sys.stdout)
+
+            if _PROFILE and n_batches:
+                total_elapsed_ms = (time.perf_counter() - t_iter_start) * 1000
+                # fetch_ms sum comes from batch_fetch events; total_batch_ms ≈ fetch + write.
+                # overhead = total_elapsed - total_batch_ms (progress prints, groupby splits, etc.)
+                print(json.dumps({
+                    "type": "ingest_timing_summary",
+                    "total_symbols": total,
+                    "n_batches": n_batches,
+                    "batch_size": batch_size,
+                    "total_elapsed_ms": round(total_elapsed_ms, 0),
+                    "total_batch_ms": round(total_batch_ms, 0),
+                    "avg_batch_ms": round(total_batch_ms / n_batches, 1),
+                }), flush=True, file=sys.stdout)
 
 
 # ---------------------------------------------------------------------------
