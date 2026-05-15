@@ -631,8 +631,8 @@ class TradingAlgorithm:
         progress_bar = None
         if self._show_progress:
             sessions = self.trading_calendar.sessions_in_range(
-                self.sim_params.start_session,
-                self.sim_params.end_session,
+                self.sim_params.start_session.tz_localize(None),
+                self.sim_params.end_session.tz_localize(None),
             )
             total_days = len(sessions)
 
