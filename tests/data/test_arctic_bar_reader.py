@@ -389,6 +389,63 @@ def test_get_value_out_of_window_after_preload_raises(arctic_uri):
         reader.get_value(0, out_of_window_dt, "close")
 
 
+def test_get_value_pre_listing_returns_nan_within_window(arctic_uri):
+    """Pre-IPO dt inside the preload window must return NaN, not raise.
+
+    Regression for the case where a newly-listed asset's data starts mid-window:
+    bcolz returns NaN for missing rows within the bundle range, so the cache
+    contract must match — otherwise any backtest touching an IPO crashes.
+    """
+    # AAPL "lists" on Jan 15, but the preload window is Jan 2 – Jan 31.
+    full_range = _make_daily_df(start="2024-01-02", end="2024-01-31")
+    df = full_range.loc["2024-01-15":]
+    _, sid_to_symbol = _setup_lib(arctic_uri, {"AAPL": df}, "XNYS", "daily")
+    reader = ArcticDailyBarReader(
+        arctic_uri, "bars", "XNYS", sid_to_symbol=sid_to_symbol,
+    )
+
+    window_start = pd.Timestamp("2024-01-02", tz="UTC")
+    window_end = pd.Timestamp("2024-01-31", tz="UTC")
+    reader.prepare_for_backtest(
+        window_start, window_end, [0], columns=["close"],
+        full_threshold_mb=10_000,
+        chunked_threshold_mb=10_000,
+    )
+
+    pre_listing_dt = pd.Timestamp("2024-01-03", tz="UTC")  # in window, pre-IPO
+    assert np.isnan(reader.get_value(0, pre_listing_dt, "close"))
+
+    # Sanity: a real listed day still returns a value.
+    listed_dt = df.index[0]
+    assert not np.isnan(reader.get_value(0, listed_dt, "close"))
+
+    # Sanity: out-of-window still raises.
+    with pytest.raises(NoDataOnDate):
+        reader.get_value(0, pd.Timestamp("2024-02-15", tz="UTC"), "close")
+
+
+def test_load_raw_arrays_raises_on_uncached_column(arctic_uri):
+    """If load_raw_arrays asks for a column that prepare_for_backtest didn't
+    cache, raise ValueError — silently returning all-NaN is indistinguishable
+    from a legitimate missing-data result.
+    """
+    df = _make_daily_df()
+    _, sid_to_symbol = _setup_lib(arctic_uri, {"AAPL": df}, "XNYS", "daily")
+    reader = ArcticDailyBarReader(
+        arctic_uri, "bars", "XNYS", sid_to_symbol=sid_to_symbol,
+    )
+    reader.prepare_for_backtest(
+        df.index[0], df.index[-1], [0], columns=["close"],
+        full_threshold_mb=10_000,
+        chunked_threshold_mb=10_000,
+    )
+
+    with pytest.raises(ValueError, match="not preloaded"):
+        reader.load_raw_arrays(
+            ["close", "volume"], df.index[0], df.index[-1], [0],
+        )
+
+
 def test_clear_cache_resets_cache(arctic_uri):
     df = _make_daily_df()
     _, sid_to_symbol = _setup_lib(arctic_uri, {"AAPL": df}, "XNYS", "daily")

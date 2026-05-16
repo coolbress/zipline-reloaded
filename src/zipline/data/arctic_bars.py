@@ -109,6 +109,13 @@ class _FullPreloadCache:
         if end_ts.tzinfo is None:
             end_ts = end_ts.tz_localize("UTC")
 
+        # Window boundaries — used by get_value to gate NoDataOnDate vs NaN.
+        # Must be the preload-window bounds (not per-symbol data extents) so a
+        # newly-listed asset returns NaN for pre-IPO dts instead of crashing.
+        self._window_start_ns = int(start_ts.value)
+        self._window_end_ns = int(end_ts.value)
+        self._columns = frozenset(columns)
+
         requests = [
             ReadRequest(sym, date_range=(start_ts, end_ts), columns=columns)
             for sym in symbols
@@ -158,10 +165,15 @@ class _FullPreloadCache:
         if field not in col_arrays:
             return float("nan")
         dt_ns = int(pd.Timestamp(dt).value)
-        # Outside the preloaded window → caller error, raise so it's diagnosable.
-        if len(ts_ns) == 0 or dt_ns < int(ts_ns[0]) or dt_ns > int(ts_ns[-1]):
+        # Outside the *preload window* → caller error, raise so it's diagnosable.
+        # Gate against the window bounds, NOT this symbol's data extents — a
+        # newly-listed asset has data starting mid-window, and pre-listing dts
+        # within the window must return NaN (bcolz-compatible) rather than
+        # raise.
+        if dt_ns < self._window_start_ns or dt_ns > self._window_end_ns:
             raise NoDataOnDate(f"dt={dt} outside preloaded window for sym={sym}")
-        # Inside the window but no exact match (non-trading day) → match raw NaN.
+        # Inside the window: exact match → value; otherwise NaN (non-trading
+        # day, pre-IPO, post-delisting, etc.).
         idx = np.searchsorted(ts_ns, dt_ns)
         if idx >= len(ts_ns) or int(ts_ns[idx]) != dt_ns:
             return float("nan")
@@ -572,6 +584,18 @@ class _ArcticReaderImpl:
         without allocating boolean masks or filtered copies — only the output
         matrices plus a small period-grid array.
         """
+        # Guard against silent all-NaN columns: prepare_for_backtest only
+        # cached the columns the caller asked for. Returning all-NaN for an
+        # uncached column would look indistinguishable from real missing data.
+        missing = set(columns) - self._cache._columns  # type: ignore[union-attr]
+        if missing:
+            raise ValueError(
+                f"load_raw_arrays requested columns {sorted(missing)} that were "
+                f"not preloaded. prepare_for_backtest cached "
+                f"{sorted(self._cache._columns)}; re-call prepare_for_backtest "  # type: ignore[union-attr]
+                f"with the full column set, or call clear_cache() first."
+            )
+
         start_ns = int(pd.Timestamp(start_date).value)
         end_ns = int(pd.Timestamp(end_date).value)
 
