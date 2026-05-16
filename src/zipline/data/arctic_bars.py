@@ -569,7 +569,14 @@ class ArcticDailyBarReader(_ArcticReaderImpl, CurrencyAwareSessionBarReader):
     def sessions(self) -> pd.DatetimeIndex:
         """All sessions covered by this bundle."""
         cal = self.trading_calendar
-        return cal.sessions_in_range(self.first_trading_day, self.last_available_dt)
+        # exchange_calendars 4.6+ requires tz-naive timestamps for sessions_in_range.
+        first = self.first_trading_day
+        last = self.last_available_dt
+        if getattr(first, "tzinfo", None) is not None:
+            first = first.tz_localize(None)
+        if getattr(last, "tzinfo", None) is not None:
+            last = last.tz_localize(None)
+        return cal.sessions_in_range(first, last)
 
     def currency_codes(self, sids) -> np.ndarray:
         """Return ISO-4217 currency codes for *sids* (always ``"USD"``)."""

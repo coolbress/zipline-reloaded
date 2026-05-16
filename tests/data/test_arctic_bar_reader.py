@@ -231,6 +231,21 @@ def test_get_last_traded_dt_returns_nat_when_no_data(arctic_uri):
     assert pd.isnull(result)
 
 
+def test_sessions_property_handles_tz_aware_metadata(arctic_uri):
+    """sessions must tolerate tz-aware first_trading_day/last_available_dt by stripping tz
+    before passing to exchange_calendars (4.6+ rejects tz-aware).
+    """
+    df = _make_daily_df(start="2024-01-02", end="2024-01-31")
+    _, sid_to_symbol = _setup_lib(arctic_uri, {"AAPL": df}, "XNYS", "daily")
+    reader = ArcticDailyBarReader(
+        arctic_uri, "bars", "XNYS", sid_to_symbol=sid_to_symbol,
+    )
+    # Should not raise — the regression was AttributeError on
+    # 'datetime.timezone' object has no attribute 'key'.
+    sessions = reader.sessions
+    assert len(sessions) > 0
+
+
 def test_currency_codes_returns_usd(arctic_uri):
     df = _make_daily_df()
     _, sid_to_symbol = _setup_lib(
