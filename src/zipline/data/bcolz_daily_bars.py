@@ -192,10 +192,9 @@ class BcolzDailyBarWriter:
         invalid_data_behavior : {'warn', 'raise', 'ignore'}, optional
             What to do when data falls outside the uint32 range.
         feature_metadata : dict, optional
-            Pre-computed feature metadata from duckdbdir._compute_feature_metadata().
-            Keys are feature column names; values are dicts with 'dtype',
-            'semantic_dtype', and either encoding/decoding maps (categorical)
-            or scale_with_thousand / negative_offset (numeric).
+            Feature column metadata. Keys are feature column names; values are
+            dicts with 'dtype', 'semantic_dtype', and either encoding/decoding
+            maps (categorical) or scale_with_thousand / negative_offset (numeric).
             Defaults to {} (OHLCV-only bundle).
         all_column_names : list[str], optional
             Ordered list of all column names in the final ctable.

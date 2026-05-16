@@ -93,8 +93,8 @@ class MetricsTracker:
         self._session_count = 0
 
         self._sessions = sessions = trading_calendar.sessions_in_range(
-            first_session,
-            last_session,
+            first_session.tz_localize(None),
+            last_session.tz_localize(None),
         )
         self._total_session_count = len(sessions)
 

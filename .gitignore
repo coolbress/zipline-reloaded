@@ -99,3 +99,6 @@ src/zipline/_version.py
 logs/
 
 explanation
+
+# Claude exec plans (local only)
+docs/exec-plans/

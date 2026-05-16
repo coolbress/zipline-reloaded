@@ -64,8 +64,13 @@ import pandas as pd
 import numpy as np
 from numpy import arange, array
 from toolz import groupby
-import pyarrow as pa
-import pyarrow.parquet as pq
+
+# NOTE — pyarrow/pyarrow.parquet are imported lazily inside the
+# ``save_path``-handling branches below. Loading them eagerly at module import
+# pulls in ``pyarrow.fs`` (Parquet → Arrow Datasets → ``_s3fs``), which
+# triggers libarrow's bundled AWS SDK and conflicts with ArcticDB's own
+# statically-linked AWS SDK when both are used in the same process.
+# Keeping pyarrow imports lazy lets ArcticDB-backed bar readers coexist.
 
 from zipline.errors import NoFurtherDataError
 from zipline.lib.adjusted_array import ensure_adjusted_array, ensure_ndarray
@@ -361,6 +366,10 @@ class SimplePipelineEngine(PipelineEngine):
 
                     # 1. 파일 저장 모드 (Stream-to-Disk)
                     if save_path is not None:
+                        # Lazy import — see top-of-module note.
+                        import pyarrow as pa
+                        import pyarrow.parquet as pq
+
                         # 변환 (속도 최적화 버전)
                         chunk_for_parquet = self._prepare_chunk_for_parquet(chunk)
 
@@ -451,12 +460,16 @@ class SimplePipelineEngine(PipelineEngine):
         
         # Save to Parquet if save_path is provided
         if save_path is not None and len(result) > 0:
+            # Lazy import — see top-of-module note.
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
             # Validate path (must have .parquet extension, create directory)
             save_path = self._validate_parquet_path(save_path)
-            
+
             # Transform result for Parquet storage
             result_for_parquet = self._prepare_chunk_for_parquet(result)
-            
+
             # Write to Parquet file with compression (일관성 유지)
             table = pa.Table.from_pandas(result_for_parquet, preserve_index=False)
             pq.write_table(
