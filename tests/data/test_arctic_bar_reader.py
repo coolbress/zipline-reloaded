@@ -406,6 +406,39 @@ def test_clear_cache_resets_cache(arctic_uri):
     assert reader._cache is None
 
 
+def test_load_raw_arrays_uses_cache_after_prepare(arctic_uri):
+    """load_raw_arrays must hit the in-memory _FullPreloadCache when one exists
+    (cache-aware fast path) and return numerically identical results to the
+    raw Arctic path.
+    """
+    df0 = _make_daily_df(seed=11)
+    df1 = _make_daily_df(seed=12)
+    _, sid_to_symbol = _setup_lib(
+        arctic_uri, {"AAPL": df0, "MSFT": df1}, "XNYS", "daily",
+    )
+    reader = ArcticDailyBarReader(
+        arctic_uri, "bars", "XNYS", sid_to_symbol=sid_to_symbol,
+    )
+
+    start = df0.index[0]
+    end = df0.index[-1]
+
+    raw_arrays = reader.load_raw_arrays(["close", "volume"], start, end, [0, 1])
+
+    reader.prepare_for_backtest(
+        start, end, [0, 1], columns=["open", "high", "low", "close", "volume"],
+        full_threshold_mb=10_000,
+        chunked_threshold_mb=10_000,
+    )
+    assert isinstance(reader._cache, _FullPreloadCache)
+    cached_arrays = reader.load_raw_arrays(["close", "volume"], start, end, [0, 1])
+
+    assert len(raw_arrays) == len(cached_arrays) == 2
+    for raw, cached in zip(raw_arrays, cached_arrays):
+        assert raw.shape == cached.shape
+        np.testing.assert_allclose(raw, cached, rtol=1e-9, equal_nan=True)
+
+
 def test_chunked_cache_rollover(arctic_uri):
     """5 months of data with chunked dispatch — accessing far-apart dates should
     advance the window's `_current_start`.

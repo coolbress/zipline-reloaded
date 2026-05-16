@@ -158,9 +158,13 @@ class _FullPreloadCache:
         if field not in col_arrays:
             return float("nan")
         dt_ns = int(pd.Timestamp(dt).value)
+        # Outside the preloaded window → caller error, raise so it's diagnosable.
+        if len(ts_ns) == 0 or dt_ns < int(ts_ns[0]) or dt_ns > int(ts_ns[-1]):
+            raise NoDataOnDate(f"dt={dt} outside preloaded window for sym={sym}")
+        # Inside the window but no exact match (non-trading day) → match raw NaN.
         idx = np.searchsorted(ts_ns, dt_ns)
-        if idx >= len(ts_ns) or ts_ns[idx] != dt_ns:
-            raise NoDataOnDate(f"No data for sym={sym} dt={dt}")
+        if idx >= len(ts_ns) or int(ts_ns[idx]) != dt_ns:
+            return float("nan")
         return float(col_arrays[field][idx])
 
 
@@ -463,8 +467,9 @@ class _ArcticReaderImpl:
     def load_raw_arrays(self, columns, start_date, end_date, assets) -> list:
         """Fetch OHLCV arrays shaped ``(n_periods, n_assets)`` from ArcticDB.
 
-        Uses ``lib.read_batch`` for parallel symbol retrieval.  Missing symbols
-        or gaps produce ``NaN`` values in the output arrays.
+        When a _FullPreloadCache is active (via ``prepare_for_backtest``),
+        slices the cached numpy arrays in-memory — orders of magnitude faster
+        than hitting Arctic. Falls back to ``lib.read_batch`` otherwise.
 
         Parameters
         ----------
@@ -477,6 +482,11 @@ class _ArcticReaderImpl:
         list[np.ndarray]
             One array per column, shape ``(n_periods, n_assets)``, dtype float64.
         """
+        # Cache-aware fast path — only _FullPreloadCache supports bulk slice
+        # because _ChunkedPreloadCache holds at most one sub-window at a time.
+        if isinstance(self._cache, _FullPreloadCache):
+            return self._load_raw_arrays_from_cache(columns, start_date, end_date, assets)
+
         from arcticdb import ReadRequest  # local — optional dep
 
         start_ts = pd.Timestamp(start_date)
@@ -537,6 +547,56 @@ class _ArcticReaderImpl:
                 out[period_indices[valid], a_idx] = col_vals[valid]
             out_arrays.append(out)
 
+        return out_arrays
+
+    def _load_raw_arrays_from_cache(self, columns, start_date, end_date, assets) -> list:
+        """Cache-aware bulk read — only used when self._cache is _FullPreloadCache.
+
+        Skips Arctic entirely. Slices the already-loaded numpy arrays in-memory.
+        """
+        start_ns = int(pd.Timestamp(start_date).value)
+        end_ns = int(pd.Timestamp(end_date).value)
+
+        # Per-symbol filtered ts + cols
+        sym_filtered: dict = {}
+        all_ts_ns: set = set()
+        for asset in assets:
+            try:
+                sym = self._sym_for_sid(int(asset))
+            except (KeyError, Exception):
+                continue
+            entry = self._cache._data.get(sym)  # type: ignore[union-attr]
+            if entry is None:
+                continue
+            ts_arr, col_arrs = entry
+            mask = (ts_arr >= start_ns) & (ts_arr <= end_ns)
+            if not mask.any():
+                continue
+            sym_filtered[asset] = (
+                ts_arr[mask],
+                {c: arr[mask] for c, arr in col_arrs.items()},
+            )
+            all_ts_ns.update(ts_arr[mask].tolist())
+
+        if not all_ts_ns:
+            return [np.empty((0, len(assets)), dtype=np.float64) for _ in columns]
+
+        periods = np.array(sorted(all_ts_ns), dtype=np.int64)
+        n_periods = len(periods)
+        n_assets = len(assets)
+
+        out_arrays = [
+            np.full((n_periods, n_assets), np.nan, dtype=np.float64) for _ in columns
+        ]
+        for a_idx, asset in enumerate(assets):
+            entry = sym_filtered.get(asset)
+            if entry is None:
+                continue
+            ts_arr, col_arrs = entry
+            period_idx = np.searchsorted(periods, ts_arr)
+            for c_idx, col in enumerate(columns):
+                if col in col_arrs:
+                    out_arrays[c_idx][period_idx, a_idx] = col_arrs[col]
         return out_arrays
 
 
