@@ -552,15 +552,18 @@ class _ArcticReaderImpl:
     def _load_raw_arrays_from_cache(self, columns, start_date, end_date, assets) -> list:
         """Cache-aware bulk read — only used when self._cache is _FullPreloadCache.
 
-        Skips Arctic entirely. Slices the already-loaded numpy arrays in-memory.
+        Skips Arctic entirely. Slices the already-loaded numpy arrays in-memory
+        without allocating boolean masks or filtered copies — only the output
+        matrices plus a small period-grid array.
         """
         start_ns = int(pd.Timestamp(start_date).value)
         end_ns = int(pd.Timestamp(end_date).value)
 
-        # Per-symbol filtered ts + cols
-        sym_filtered: dict = {}
-        all_ts_ns: set = set()
-        for asset in assets:
+        # First pass: locate each asset's slice into its cached ts array.
+        # We store (a_idx, ts_arr, col_arrs, lo, hi) — no copies, just views.
+        sym_slices: list = []
+        ts_views: list = []
+        for a_idx, asset in enumerate(assets):
             try:
                 sym = self._sym_for_sid(int(asset))
             except (KeyError, Exception):
@@ -569,34 +572,31 @@ class _ArcticReaderImpl:
             if entry is None:
                 continue
             ts_arr, col_arrs = entry
-            mask = (ts_arr >= start_ns) & (ts_arr <= end_ns)
-            if not mask.any():
+            lo = int(np.searchsorted(ts_arr, start_ns, side="left"))
+            hi = int(np.searchsorted(ts_arr, end_ns, side="right"))
+            if lo >= hi:
                 continue
-            sym_filtered[asset] = (
-                ts_arr[mask],
-                {c: arr[mask] for c, arr in col_arrs.items()},
-            )
-            all_ts_ns.update(ts_arr[mask].tolist())
+            sym_slices.append((a_idx, ts_arr, col_arrs, lo, hi))
+            ts_views.append(ts_arr[lo:hi])
 
-        if not all_ts_ns:
+        if not sym_slices:
             return [np.empty((0, len(assets)), dtype=np.float64) for _ in columns]
 
-        periods = np.array(sorted(all_ts_ns), dtype=np.int64)
-        n_periods = len(periods)
+        # Union the relevant timestamps via concat + unique (sorted dedup in C,
+        # no Python-level set conversion).
+        periods = np.unique(np.concatenate(ts_views))
+        n_periods = periods.shape[0]
         n_assets = len(assets)
 
         out_arrays = [
             np.full((n_periods, n_assets), np.nan, dtype=np.float64) for _ in columns
         ]
-        for a_idx, asset in enumerate(assets):
-            entry = sym_filtered.get(asset)
-            if entry is None:
-                continue
-            ts_arr, col_arrs = entry
-            period_idx = np.searchsorted(periods, ts_arr)
+        for a_idx, ts_arr, col_arrs, lo, hi in sym_slices:
+            period_idx = np.searchsorted(periods, ts_arr[lo:hi])
             for c_idx, col in enumerate(columns):
-                if col in col_arrs:
-                    out_arrays[c_idx][period_idx, a_idx] = col_arrs[col]
+                arr = col_arrs.get(col)
+                if arr is not None:
+                    out_arrays[c_idx][period_idx, a_idx] = arr[lo:hi]
         return out_arrays
 
 
