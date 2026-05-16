@@ -479,9 +479,8 @@ def _load_adjustments_from_arctic(
     volume_adjustments: dict[int, list] = {}
 
     # splits affect prices and volumes (inverse).
+    # `_filtered_rows` already enforces `eff_seconds >= start_seconds`.
     for sid, ratio, eff_seconds in splits:
-        if eff_seconds < start_seconds:
-            continue
         date_loc = lookup_dt(eff_seconds)
         a_ix = asset_ix(sid)
         if should_include_price:
@@ -495,8 +494,6 @@ def _load_adjustments_from_arctic(
 
     # mergers and dividends affect prices only.
     for sid, ratio, eff_seconds in mergers + dividends:
-        if eff_seconds < start_seconds:
-            continue
         date_loc = lookup_dt(eff_seconds)
         a_ix = asset_ix(sid)
         price_adjustments.setdefault(date_loc, []).append(

@@ -112,20 +112,25 @@ def arctic_uri(minio_server):
         aws_secret_access_key=MINIO_PASS,
         region_name="us-east-1",
     )
-    s3.create_bucket(Bucket=bucket)
-
-    uri = (
-        f"s3://127.0.0.1:{bucket}"
-        f"?access={MINIO_USER}&secret={MINIO_PASS}"
-        f"&port={port}&ssl=False&use_virtual_addressing=False"
-    )
-    yield uri
-
-    # Best-effort cleanup; ignore errors so test failures aren't masked.
     try:
-        listing = s3.list_objects_v2(Bucket=bucket).get("Contents", [])
-        for obj in listing:
-            s3.delete_object(Bucket=bucket, Key=obj["Key"])
-        s3.delete_bucket(Bucket=bucket)
-    except Exception:
-        pass
+        s3.create_bucket(Bucket=bucket)
+
+        uri = (
+            f"s3://127.0.0.1:{bucket}"
+            f"?access={MINIO_USER}&secret={MINIO_PASS}"
+            f"&port={port}&ssl=False&use_virtual_addressing=False"
+        )
+        yield uri
+
+        # Best-effort cleanup; ignore errors so test failures aren't masked.
+        try:
+            listing = s3.list_objects_v2(Bucket=bucket).get("Contents", [])
+            for obj in listing:
+                s3.delete_object(Bucket=bucket, Key=obj["Key"])
+            s3.delete_bucket(Bucket=bucket)
+        except Exception:
+            pass
+    finally:
+        # Release the underlying connection pool — boto3 keeps sockets alive
+        # otherwise, which leaks across tests on macOS.
+        s3.close()

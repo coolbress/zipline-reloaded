@@ -297,18 +297,26 @@ class _ArcticReaderImpl:
             return {}
 
     def _sym_for_sid(self, sid: int) -> str:
-        """Return the ArcticDB symbol string for *sid*."""
+        """Return the ArcticDB symbol string for *sid*.
+
+        Falls back to ``str(sid)`` only when the finder explicitly reports the
+        sid is unknown — other errors are surfaced so finder corruption isn't
+        silently masked as a missing symbol.
+        """
         if sid in self._sid_to_symbol:
             return self._sid_to_symbol[sid]
         if self._asset_finder is not None:
+            from zipline.errors import SidsNotFound
+
             try:
                 asset = self._asset_finder.retrieve_asset(sid)
+            except (SidsNotFound, KeyError):
+                pass
+            else:
                 sym = asset.symbol
                 self._sid_to_symbol[sid] = sym
                 return sym
-            except Exception:
-                pass
-        # Best-effort fallback
+        # Best-effort fallback for unknown sid (no finder, or finder skipped it).
         return str(sid)
 
     def _raw_get_value(self, sym: str, dt, field: str) -> float:
@@ -572,10 +580,9 @@ class _ArcticReaderImpl:
         sym_slices: list = []
         ts_views: list = []
         for a_idx, asset in enumerate(assets):
-            try:
-                sym = self._sym_for_sid(int(asset))
-            except Exception:
-                continue
+            # _sym_for_sid now only raises on real finder errors (not "sid not
+            # found") — let those propagate so a broken finder is diagnosable.
+            sym = self._sym_for_sid(int(asset))
             entry = self._cache._data.get(sym)  # type: ignore[union-attr]
             if entry is None:
                 continue
@@ -633,9 +640,9 @@ class ArcticDailyBarReader(_ArcticReaderImpl, CurrencyAwareSessionBarReader):
     def data_frequency(self) -> str:
         return "session"
 
-    @property
+    @lazyval
     def sessions(self) -> pd.DatetimeIndex:
-        """All sessions covered by this bundle."""
+        """All sessions covered by this bundle (immutable per reader instance)."""
         cal = self.trading_calendar
         # exchange_calendars 4.6+ requires tz-naive timestamps for sessions_in_range.
         first = self.first_trading_day
