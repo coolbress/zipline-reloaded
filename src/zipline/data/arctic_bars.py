@@ -418,6 +418,14 @@ class _ArcticReaderImpl:
         return get_calendar(self._calendar_name)
 
     def get_value(self, sid, dt, field: str) -> float:
+        """Single-cell lookup.
+
+        Behaviour for ``dt`` outside the reader's available range differs by
+        path: the raw (no-cache) path returns ``NaN`` silently, while the
+        preload cache raises :class:`NoDataOnDate` so accidental out-of-window
+        access is diagnosable after :meth:`prepare_for_backtest`.
+        Both paths return ``NaN`` for in-range non-trading instants.
+        """
         sym = self._sym_for_sid(int(sid))
         if self._cache is not None:
             return self._cache.get_value(sym, dt, field)
@@ -566,7 +574,7 @@ class _ArcticReaderImpl:
         for a_idx, asset in enumerate(assets):
             try:
                 sym = self._sym_for_sid(int(asset))
-            except (KeyError, Exception):
+            except Exception:
                 continue
             entry = self._cache._data.get(sym)  # type: ignore[union-attr]
             if entry is None:

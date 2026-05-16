@@ -39,7 +39,6 @@ import pandas as pd
 
 from zipline.lib.adjustment import Float64Multiply
 from zipline.utils.memoize import lazyval
-from zipline.utils.pandas_utils import timedelta_to_integral_seconds
 
 log = logging.getLogger(__name__)
 
@@ -76,9 +75,12 @@ def _column_seconds(series: pd.Series) -> np.ndarray:
     if series.empty:
         return np.array([], dtype=np.int64)
     s = pd.to_datetime(series)
-    if getattr(s.dt, "tz", None) is None:
-        s = s.dt.tz_localize("UTC")
-    return (s.view("int64") // 1_000_000_000).astype(np.int64).to_numpy()
+    if getattr(s.dt, "tz", None) is not None:
+        s = s.dt.tz_convert("UTC").dt.tz_localize(None)
+    # Naive datetime64[ns] → int64 ns is stable across pandas versions
+    # (avoids the deprecated Series.view path).
+    ns = s.to_numpy(dtype="datetime64[ns]").astype("int64")
+    return (ns // 1_000_000_000).astype(np.int64)
 
 
 class ArcticAdjustmentReader:
@@ -133,6 +135,16 @@ class ArcticAdjustmentReader:
         # uses explicit columns (effective_date / ex_date / sid).
         if df.index.name is not None or not isinstance(df.index, pd.RangeIndex):
             df = df.reset_index(drop=False) if df.index.name else df.reset_index(drop=True)
+
+        # Validate schema against the canonical column set so a malformed write
+        # surfaces here rather than as a confusing KeyError deep in load_adjustments.
+        expected = set(_empty_table(name).columns)
+        missing = expected - set(df.columns)
+        if missing:
+            raise ValueError(
+                f"ArcticAdjustmentReader: library {lib_name!r} is missing required "
+                f"columns {sorted(missing)}; got {sorted(df.columns)}"
+            )
 
         self._cache[name] = df
         return df
