@@ -21,6 +21,9 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from zoneinfo import ZoneInfo
+
+_UTC = ZoneInfo("UTC")
 
 from zipline.data.bar_reader import NoDataOnDate, NoDataBeforeDate, NoDataAfterDate
 from zipline.data.session_bars import CurrencyAwareSessionBarReader
@@ -420,7 +423,7 @@ class _ArcticReaderImpl:
     @property
     def last_available_dt(self) -> pd.Timestamp:
         if self._end_session_ns is not None:
-            return pd.Timestamp(self._end_session_ns, unit="ns", tz="UTC")
+            return pd.Timestamp(self._end_session_ns, unit="ns").tz_localize(_UTC)
         raise AttributeError(
             "last_available_dt: no end_session_ns in bundle metadata or constructor"
         )
@@ -428,7 +431,7 @@ class _ArcticReaderImpl:
     @property
     def first_trading_day(self) -> pd.Timestamp:
         if self._start_session_ns is not None:
-            return pd.Timestamp(self._start_session_ns, unit="ns", tz="UTC")
+            return pd.Timestamp(self._start_session_ns, unit="ns").tz_localize(_UTC)
         raise AttributeError(
             "first_trading_day: no start_session_ns in bundle metadata or constructor"
         )
@@ -464,7 +467,7 @@ class _ArcticReaderImpl:
 
         # Determine earliest reasonable start for the backward scan.
         if self._start_session_ns is not None:
-            scan_start = pd.Timestamp(self._start_session_ns, unit="ns", tz="UTC")
+            scan_start = pd.Timestamp(self._start_session_ns, unit="ns").tz_localize(_UTC)
         else:
             scan_start = ts - pd.DateOffset(years=10)
 
