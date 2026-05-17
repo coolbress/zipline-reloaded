@@ -423,7 +423,7 @@ class _ArcticReaderImpl:
     @property
     def last_available_dt(self) -> pd.Timestamp:
         if self._end_session_ns is not None:
-            return pd.Timestamp(self._end_session_ns, unit="ns").tz_localize(_UTC)
+            return pd.Timestamp(self._end_session_ns, unit="ns")
         raise AttributeError(
             "last_available_dt: no end_session_ns in bundle metadata or constructor"
         )
@@ -431,7 +431,7 @@ class _ArcticReaderImpl:
     @property
     def first_trading_day(self) -> pd.Timestamp:
         if self._start_session_ns is not None:
-            return pd.Timestamp(self._start_session_ns, unit="ns").tz_localize(_UTC)
+            return pd.Timestamp(self._start_session_ns, unit="ns")
         raise AttributeError(
             "first_trading_day: no start_session_ns in bundle metadata or constructor"
         )
