@@ -3,6 +3,7 @@ import errno
 import os
 import shutil
 import warnings
+from typing import Callable, Mapping, Optional
 
 import click
 import logging
@@ -265,7 +266,9 @@ def _make_bundle_core():
         end_session=None,
         minutes_per_day=390,
         create_writers=True,
-        loader=None,
+        loader: Optional[
+            Callable[[str, Mapping[str, str], pd.Timestamp], "BundleData"]
+        ] = None,
     ):
         """Register a data bundle ingest function.
 
@@ -360,7 +363,7 @@ def _make_bundle_core():
             minutes_per_day=minutes_per_day,
             ingest=f,
             create_writers=create_writers,
-            loader=loader,
+            loader=loader if loader is not None else _default_bcolz_loader,
         )
         return f
 
@@ -551,6 +554,36 @@ def _make_bundle_core():
                 ),
             )
 
+    def _default_bcolz_loader(name, environ, timestamp):
+        """Default loader: construct stock BCOLZ + SQLite readers.
+
+        Used whenever ``register(name, f)`` is called without an explicit
+        ``loader=``. The csvdir / quandl bundles flow through here; custom
+        backends (ArcticDB, Parquet, …) supply their own callback at
+        register time.
+
+        Closed over the factory's ``most_recent_data`` so test fixtures
+        that build an isolated registry via ``_make_bundle_core()`` use
+        that registry's bundle lookup, not the module-level one.
+        """
+        timestr = most_recent_data(name, timestamp, environ=environ)
+
+        daily_bars_path = daily_equity_path(name, timestr, environ=environ)
+        daily_bar_reader = BcolzDailyBarReader(daily_bars_path)
+
+        return BundleData(
+            asset_finder=AssetFinder(
+                asset_db_path(name, timestr, environ=environ),
+            ),
+            equity_minute_bar_reader=BcolzMinuteBarReader(
+                minute_equity_path(name, timestr, environ=environ),
+            ),
+            equity_daily_bar_reader=daily_bar_reader,
+            adjustment_reader=SQLiteAdjustmentReader(
+                adjustment_db_path(name, timestr, environ=environ),
+            ),
+        )
+
     def load(name, environ=os.environ, timestamp=None):
         """Loads a previously ingested bundle.
 
@@ -571,33 +604,9 @@ def _make_bundle_core():
         """
         if timestamp is None:
             timestamp = pd.Timestamp.utcnow()
-
-        # Backend dispatch — when ``register(name, ..., loader=fn)`` is set,
-        # delegate to the custom callback so ArcticDB / Parquet / etc. don't
-        # need to fork ``load`` or duplicate the bundle registry. The default
-        # BCOLZ + SQLite path runs when no custom loader was registered, so
-        # stock bundles (``quandl``, ``csvdir``) are unaffected.
-        bundle = bundles.get(name)
-        if bundle is not None and bundle.loader is not None:
-            return bundle.loader(name, environ, timestamp)
-
-        timestr = most_recent_data(name, timestamp, environ=environ)
-
-        daily_bars_path = daily_equity_path(name, timestr, environ=environ)
-        daily_bar_reader = BcolzDailyBarReader(daily_bars_path)
-
-        return BundleData(
-            asset_finder=AssetFinder(
-                asset_db_path(name, timestr, environ=environ),
-            ),
-            equity_minute_bar_reader=BcolzMinuteBarReader(
-                minute_equity_path(name, timestr, environ=environ),
-            ),
-            equity_daily_bar_reader=daily_bar_reader,
-            adjustment_reader=SQLiteAdjustmentReader(
-                adjustment_db_path(name, timestr, environ=environ),
-            ),
-        )
+        if name not in bundles:
+            raise UnknownBundle(name)
+        return bundles[name].loader(name, environ, timestamp)
 
     @preprocess(
         before=optionally(ensure_timestamp),

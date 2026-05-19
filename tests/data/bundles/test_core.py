@@ -53,6 +53,7 @@ class BundleCoreTestCase(WithInstanceTmpDir, WithDefaultDateBounds, ZiplineTestC
 
     def init_instance_fixtures(self):
         super(BundleCoreTestCase, self).init_instance_fixtures()
+        _core, _ = _make_bundle_core()
         (
             self.bundles,
             self.register,
@@ -60,7 +61,7 @@ class BundleCoreTestCase(WithInstanceTmpDir, WithDefaultDateBounds, ZiplineTestC
             self.ingest,
             self.load,
             self.clean,
-        ) = _make_bundle_core()
+        ) = _core
         self.environ = {"ZIPLINE_ROOT": self.instance_tmpdir.path}
 
     def test_register_decorator(self):
@@ -540,3 +541,52 @@ class BundleCoreTestCase(WithInstanceTmpDir, WithDefaultDateBounds, ZiplineTestC
             fourth,
             fifth,
         }, "did not strip first and last directories"
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Loader plug-in dispatch (register / load polymorphism)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def test_register_without_loader_assigns_default(self):
+        """register(name, f) without loader= still produces a callable loader."""
+        self.register("smoke_default", lambda *a, **kw: None)
+        loader = self.bundles["smoke_default"].loader
+        assert loader is not None
+        assert callable(loader)
+        # Every bundle registered through the same factory shares the same
+        # default callable — identity guards against accidentally creating a
+        # fresh closure per register() call.
+        self.register("smoke_default_2", lambda *a, **kw: None)
+        assert self.bundles["smoke_default_2"].loader is loader
+        self.unregister("smoke_default")
+        self.unregister("smoke_default_2")
+
+    def test_register_with_custom_loader_preserves_callback(self):
+        """register(name, f, loader=fn) keeps fn verbatim — not wrapped."""
+        def custom(name, environ, timestamp):  # pragma: no cover
+            return None
+
+        self.register("smoke_custom", lambda *a, **kw: None, loader=custom)
+        assert self.bundles["smoke_custom"].loader is custom
+        self.unregister("smoke_custom")
+
+    def test_load_dispatches_to_registered_loader(self):
+        """load(name) invokes the bundle's loader with (name, environ, ts)."""
+        captured = {}
+
+        def fake_loader(name, environ, timestamp):
+            captured["args"] = (name, environ, timestamp)
+            return "fake-bundle-data"
+
+        self.register("smoke_dispatch", lambda *a, **kw: None, loader=fake_loader)
+        ts = pd.Timestamp("2024-01-01", tz="UTC")
+        result = self.load("smoke_dispatch", environ=self.environ, timestamp=ts)
+        assert result == "fake-bundle-data"
+        assert captured["args"][0] == "smoke_dispatch"
+        assert captured["args"][1] is self.environ
+        assert captured["args"][2] == ts
+        self.unregister("smoke_dispatch")
+
+    def test_load_unknown_bundle_raises(self):
+        """load(name) on an unregistered name raises UnknownBundle directly."""
+        with pytest.raises(UnknownBundle):
+            self.load("never_registered", environ=self.environ)
