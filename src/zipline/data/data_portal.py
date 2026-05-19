@@ -154,16 +154,6 @@ class DataPortal:
         self._mergers_dict = {}
         self._dividends_dict = {}
 
-        # Backend-agnostic adjustments cache. The legacy sqlite reader exposes
-        # ``.conn`` and is queried per-session via SQL; non-sqlite readers
-        # (e.g. ``ArcticAdjustmentReader``) expose
-        # ``unpack_db_to_component_dfs`` and are unpacked once into this dict
-        # so per-session lookups stay in-memory. Single combined dict instead
-        # of per-table caches: ``unpack`` returns every table in one call, so
-        # splitting the cache would just double the cold-start cost (one Arctic
-        # round-trip per table × 5 tables).
-        self._adj_component_dfs: dict | None = None
-
         # Handle extra sources, like Fetcher.
         self._augmented_sources_map = {}
         self._extra_source_df = None
@@ -1089,23 +1079,6 @@ class DataPortal:
 
         return adjustments
 
-    def _arctic_component_dfs(self) -> dict:
-        """Lazily snapshot the non-sqlite adjustments reader into one dict.
-
-        The Arctic-backed reader (and any future DataFrame-backed reader)
-        exposes ``unpack_db_to_component_dfs`` instead of ``.conn``. We call
-        it once on first access — it batches every adjustment table in a
-        single read — and serve all subsequent per-session lookups from
-        the in-memory snapshot. Splitting the cache per table doubled the
-        cold-start cost in practice (4:07 → 2:16 was measured when
-        consolidating from two caches into one).
-        """
-        if self._adj_component_dfs is None:
-            self._adj_component_dfs = (
-                self._adjustment_reader.unpack_db_to_component_dfs(convert_dates=False)
-            )
-        return self._adj_component_dfs
-
     def get_splits(self, assets, dt):
         """Returns any splits for the given sids and the given dt.
 
@@ -1124,40 +1097,9 @@ class DataPortal:
         """
         if self._adjustment_reader is None or not assets:
             return []
-
-        # convert dt to # of seconds since epoch, because that's what we use
-        # in the adjustments db
-        seconds = int(dt.value / 1e9)
-
-        # Backend dispatch by duck-typing: the sqlite reader is queried via
-        # ``.conn.execute(SQL)``; DataFrame-backed readers (e.g.
-        # ``ArcticAdjustmentReader``) expose ``unpack_db_to_component_dfs``
-        # and have no ``.conn``. The legacy sqlite path is preserved
-        # unchanged; the Arctic path reads from the per-instance cache.
-        if hasattr(self._adjustment_reader, "conn"):
-            splits = self._adjustment_reader.conn.execute(
-                "SELECT sid, ratio FROM SPLITS WHERE effective_date = ?", (seconds,)
-            ).fetchall()
-
-            splits = [split for split in splits if split[0] in assets]
-            splits = [
-                (self.asset_finder.retrieve_asset(split[0]), split[1])
-                for split in splits
-            ]
-
-            return splits
-
-        df = self._arctic_component_dfs().get("splits")
-        if df is None or df.empty:
-            return []
-        match = df[df["effective_date"] == seconds]
-        if match.empty:
-            return []
-        sid_set = {int(a.sid) if hasattr(a, "sid") else int(a) for a in assets}
+        rows = self._adjustment_reader.get_splits(assets, dt)
         return [
-            (self.asset_finder.retrieve_asset(int(s)), float(r))
-            for s, r in zip(match["sid"], match["ratio"])
-            if int(s) in sid_set
+            (self.asset_finder.retrieve_asset(sid), ratio) for sid, ratio in rows
         ]
 
     def get_stock_dividends(self, sid, trading_days):
@@ -1177,66 +1119,9 @@ class DataPortal:
         list: A list of objects with all relevant attributes populated.
         All timestamp fields are converted to pd.Timestamps.
         """
-
         if self._adjustment_reader is None:
             return []
-
-        if len(trading_days) == 0:
-            return []
-
-        start_dt = trading_days[0].value / 1e9
-        end_dt = trading_days[-1].value / 1e9
-
-        # Duck-typed dispatch — see ``get_splits`` for the rationale.
-        if hasattr(self._adjustment_reader, "conn"):
-            dividends = self._adjustment_reader.conn.execute(
-                "SELECT declared_date, ex_date, pay_date, payment_sid, ratio, "
-                "record_date, sid FROM stock_dividend_payouts "
-                "WHERE sid = ? AND ex_date > ? AND pay_date < ?",
-                (
-                    int(sid),
-                    start_dt,
-                    end_dt,
-                ),
-            ).fetchall()
-
-            dividend_info = []
-            for dividend_tuple in dividends:
-                dividend_info.append(
-                    {
-                        "declared_date": pd.Timestamp(dividend_tuple[0], unit="s"),
-                        "ex_date": pd.Timestamp(dividend_tuple[1], unit="s"),
-                        "pay_date": pd.Timestamp(dividend_tuple[2], unit="s"),
-                        "payment_sid": dividend_tuple[3],
-                        "ratio": dividend_tuple[4],
-                        "record_date": pd.Timestamp(dividend_tuple[5], unit="s"),
-                        "sid": dividend_tuple[6],
-                    }
-                )
-
-            return dividend_info
-
-        df = self._arctic_component_dfs().get("stock_dividend_payouts")
-        if df is None or df.empty:
-            return []
-        mask = (
-            (df["sid"].astype(int) == int(sid))
-            & (df["ex_date"] > int(start_dt))
-            & (df["pay_date"] < int(end_dt))
-        )
-        rows = df[mask]
-        return [
-            {
-                "declared_date": pd.Timestamp(int(r["declared_date"]), unit="s"),
-                "ex_date": pd.Timestamp(int(r["ex_date"]), unit="s"),
-                "pay_date": pd.Timestamp(int(r["pay_date"]), unit="s"),
-                "payment_sid": r["payment_sid"],
-                "ratio": float(r["ratio"]),
-                "record_date": pd.Timestamp(int(r["record_date"]), unit="s"),
-                "sid": int(r["sid"]),
-            }
-            for _, r in rows.iterrows()
-        ]
+        return self._adjustment_reader.get_stock_dividends(sid, trading_days)
 
     def contains(self, asset, field):
         return field in BASE_FIELDS or (
