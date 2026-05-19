@@ -102,3 +102,6 @@ explanation
 
 # Claude exec plans (local only)
 docs/exec-plans/
+
+# Claude Code session workspace (per-task scratch)
+.claude/workspace/
