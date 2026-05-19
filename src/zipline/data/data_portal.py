@@ -38,6 +38,7 @@ from zipline.assets.roll_finder import (
     CalendarRollFinder,
     VolumeRollFinder,
 )
+from zipline.data.adjustment_reader import AdjustmentReader
 from zipline.data.dispatch_bar_reader import (
     AssetDispatchMinuteBarReader,
     AssetDispatchSessionBarReader,
@@ -147,7 +148,7 @@ class DataPortal:
 
         self.asset_finder = asset_finder
 
-        self._adjustment_reader = adjustment_reader
+        self._adjustment_reader: AdjustmentReader | None = adjustment_reader
 
         # caches of sid -> adjustment list
         self._splits_dict = {}
