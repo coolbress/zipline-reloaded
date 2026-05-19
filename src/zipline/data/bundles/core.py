@@ -141,6 +141,12 @@ RegisteredBundle = namedtuple(
         "minutes_per_day",
         "ingest",
         "create_writers",
+        # Optional custom load callback — when set, ``bundles.load(name)``
+        # delegates to it instead of constructing the default BCOLZ + SQLite
+        # readers. Signature: ``(name, environ, timestamp) -> BundleData``.
+        # Lets non-BCOLZ backends (e.g. ArcticDB) plug into the bundle
+        # registry without duplicating ``register`` / ``load`` / CLI plumbing.
+        "loader",
     ],
 )
 
@@ -259,6 +265,7 @@ def _make_bundle_core():
         end_session=None,
         minutes_per_day=390,
         create_writers=True,
+        loader=None,
     ):
         """Register a data bundle ingest function.
 
@@ -309,6 +316,18 @@ def _make_bundle_core():
             Should the ingest machinery create the writers for the ingest
             function. This can be disabled as an optimization for cases where
             they are not needed, like the ``quantopian-quandl`` bundle.
+        loader : callable, optional
+            Custom callback used by ``load(name)`` instead of the default
+            BCOLZ + SQLite reader construction. Signature::
+
+                loader(name: str, environ: Mapping, timestamp: pd.Timestamp)
+                    -> BundleData
+
+            Lets non-BCOLZ backends (ArcticDB, Parquet, …) plug into the
+            existing bundle registry — ``load`` / CLI / discovery keep
+            working without subclassing or new bundle-type files. The
+            ``ingest`` callable is typically a no-op for bundles whose data
+            is written outside of zipline (e.g. by a separate pipeline).
 
         Notes
         -----
@@ -341,6 +360,7 @@ def _make_bundle_core():
             minutes_per_day=minutes_per_day,
             ingest=f,
             create_writers=create_writers,
+            loader=loader,
         )
         return f
 
@@ -551,11 +571,21 @@ def _make_bundle_core():
         """
         if timestamp is None:
             timestamp = pd.Timestamp.utcnow()
+
+        # Backend dispatch — when ``register(name, ..., loader=fn)`` is set,
+        # delegate to the custom callback so ArcticDB / Parquet / etc. don't
+        # need to fork ``load`` or duplicate the bundle registry. The default
+        # BCOLZ + SQLite path runs when no custom loader was registered, so
+        # stock bundles (``quandl``, ``csvdir``) are unaffected.
+        bundle = bundles.get(name)
+        if bundle is not None and bundle.loader is not None:
+            return bundle.loader(name, environ, timestamp)
+
         timestr = most_recent_data(name, timestamp, environ=environ)
-        
+
         daily_bars_path = daily_equity_path(name, timestr, environ=environ)
         daily_bar_reader = BcolzDailyBarReader(daily_bars_path)
-        
+
         return BundleData(
             asset_finder=AssetFinder(
                 asset_db_path(name, timestr, environ=environ),
