@@ -159,7 +159,14 @@ def _run(
         else:
             click.echo(algotext)
 
-    first_trading_day = bundle_data.equity_minute_bar_reader.first_trading_day
+    # Bundles produced by non-BCOLZ backends (e.g. fyan ArcticDB) may ship
+    # daily-only data with ``equity_minute_bar_reader=None``. Fall back to
+    # the daily reader's ``first_trading_day`` so daily-frequency backtests
+    # against those bundles aren't blocked by a missing minute reader.
+    if bundle_data.equity_minute_bar_reader is not None:
+        first_trading_day = bundle_data.equity_minute_bar_reader.first_trading_day
+    else:
+        first_trading_day = bundle_data.equity_daily_bar_reader.first_trading_day
 
     data = DataPortal(
         bundle_data.asset_finder,
