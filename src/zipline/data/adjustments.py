@@ -221,6 +221,79 @@ class SQLiteAdjustmentReader:
             for adjustment in adjustments_for_sid
         ]
 
+    def get_splits(self, assets, dt):
+        """Return splits effective on ``dt`` for the given assets.
+
+        Parameters
+        ----------
+        assets : container
+            Assets (or sids) to filter for. Membership is checked with
+            ``in``; ``Asset`` instances and bare ints both work.
+        dt : pd.Timestamp
+            The midnight-UTC date to look up.
+
+        Returns
+        -------
+        list[(int, float)]
+            ``[(sid, ratio), ...]`` rows matching ``effective_date == dt``
+            and whose sid is in ``assets``. Empty list if no rows match
+            or ``assets`` is empty.
+        """
+        if not assets:
+            return []
+        seconds = int(dt.value / 1e9)
+        rows = self.conn.execute(
+            "SELECT sid, ratio FROM SPLITS WHERE effective_date = ?",
+            (seconds,),
+        ).fetchall()
+        return [(sid, ratio) for sid, ratio in rows if sid in assets]
+
+    def get_stock_dividends(self, sid, trading_days):
+        """Return stock-dividend payouts for ``sid`` within ``trading_days``.
+
+        Selection mirrors the legacy DataPortal SQL — ``ex_date`` strictly
+        after the first trading day and ``pay_date`` strictly before the
+        last (both compared in seconds since epoch).
+
+        Parameters
+        ----------
+        sid : int
+            The asset whose stock dividends to return.
+        trading_days : pd.DatetimeIndex
+            The active trading range; ``trading_days[0]`` / ``[-1]`` bound
+            the lookup.
+
+        Returns
+        -------
+        list[dict]
+            One dict per payout with keys ``declared_date``, ``ex_date``,
+            ``pay_date``, ``payment_sid``, ``ratio``, ``record_date``,
+            ``sid``. Timestamp fields are tz-naive ``pd.Timestamp`` at
+            second resolution.
+        """
+        if len(trading_days) == 0:
+            return []
+        start_dt = trading_days[0].value / 1e9
+        end_dt = trading_days[-1].value / 1e9
+        rows = self.conn.execute(
+            "SELECT declared_date, ex_date, pay_date, payment_sid, ratio, "
+            "record_date, sid FROM stock_dividend_payouts "
+            "WHERE sid = ? AND ex_date > ? AND pay_date < ?",
+            (int(sid), start_dt, end_dt),
+        ).fetchall()
+        return [
+            {
+                "declared_date": pd.Timestamp(row[0], unit="s"),
+                "ex_date": pd.Timestamp(row[1], unit="s"),
+                "pay_date": pd.Timestamp(row[2], unit="s"),
+                "payment_sid": row[3],
+                "ratio": row[4],
+                "record_date": pd.Timestamp(row[5], unit="s"),
+                "sid": row[6],
+            }
+            for row in rows
+        ]
+
     def get_dividends_with_ex_date(self, assets, date, asset_finder):
         seconds = date.value / int(1e9)
         c = self.conn.cursor()

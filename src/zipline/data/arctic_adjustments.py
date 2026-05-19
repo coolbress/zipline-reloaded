@@ -238,6 +238,67 @@ class ArcticAdjustmentReader:
             out.append([ts, float(row["ratio"])])
         return out
 
+    def get_splits(self, assets, dt) -> list:
+        """See ``SQLiteAdjustmentReader.get_splits``.
+
+        Reads from the instance-level ``_cache`` (populated lazily by
+        ``_read_table``), so repeated calls within a session do not
+        re-hit Arctic.
+        """
+        if not assets:
+            return []
+        df = self._read_table("splits")
+        if df.empty:
+            return []
+        seconds = _to_int_seconds(dt)
+        date_seconds = _column_seconds(df["effective_date"])
+        sid_arr = df["sid"].astype(np.int64).to_numpy()
+        ratio_arr = df["ratio"].astype(np.float64).to_numpy()
+        sid_set = {int(getattr(a, "sid", a)) for a in assets}
+        mask = (date_seconds == seconds) & np.isin(
+            sid_arr, np.fromiter(sid_set, dtype=np.int64, count=len(sid_set))
+        )
+        return [
+            (int(s), float(r)) for s, r in zip(sid_arr[mask], ratio_arr[mask])
+        ]
+
+    def get_stock_dividends(self, sid, trading_days) -> list:
+        """See ``SQLiteAdjustmentReader.get_stock_dividends``.
+
+        Reads from the instance-level cache. Compares in int seconds to
+        match the SQLite reader's contract byte-for-byte.
+        """
+        if len(trading_days) == 0:
+            return []
+        df = self._read_table("stock_dividend_payouts")
+        if df.empty:
+            return []
+        start_seconds = int(trading_days[0].value / 1e9)
+        end_seconds = int(trading_days[-1].value / 1e9)
+        date_cols = ("declared_date", "ex_date", "pay_date", "record_date")
+        seconds = {col: _column_seconds(df[col]) for col in date_cols}
+        sid_arr = df["sid"].astype(np.int64).to_numpy()
+        payment_sid_arr = df["payment_sid"].astype(np.int64).to_numpy()
+        ratio_arr = df["ratio"].astype(np.float64).to_numpy()
+        mask = (
+            (sid_arr == int(sid))
+            & (seconds["ex_date"] > start_seconds)
+            & (seconds["pay_date"] < end_seconds)
+        )
+        idx = np.flatnonzero(mask)
+        return [
+            {
+                "declared_date": pd.Timestamp(int(seconds["declared_date"][i]), unit="s"),
+                "ex_date": pd.Timestamp(int(seconds["ex_date"][i]), unit="s"),
+                "pay_date": pd.Timestamp(int(seconds["pay_date"][i]), unit="s"),
+                "payment_sid": int(payment_sid_arr[i]),
+                "ratio": float(ratio_arr[i]),
+                "record_date": pd.Timestamp(int(seconds["record_date"][i]), unit="s"),
+                "sid": int(sid_arr[i]),
+            }
+            for i in idx
+        ]
+
     def get_dividends_with_ex_date(
         self, assets, date, asset_finder
     ) -> list:

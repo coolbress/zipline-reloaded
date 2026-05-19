@@ -427,3 +427,106 @@ def test_empty_library_returns_empty_results(arctic_uri):
         dates, assets, True, True, True, "all"
     )
     assert result == {"price": {}, "volume": {}}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# get_splits / get_stock_dividends parity (DataPortal hot-path methods)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_get_splits_match(sqlite_db, seeded_arctic):
+    sql_reader = SQLiteAdjustmentReader(str(sqlite_db))
+    arc_reader = ArcticAdjustmentReader(seeded_arctic)
+
+    dt = pd.Timestamp("2024-01-15", tz="UTC")
+    assets = [1, 2]
+    sql_rows = sorted(sql_reader.get_splits(assets, dt))
+    arc_rows = sorted(arc_reader.get_splits(assets, dt))
+    assert sql_rows == arc_rows
+    assert len(sql_rows) == 1
+    sid, ratio = sql_rows[0]
+    assert sid == 1
+    assert ratio == pytest.approx(0.5)
+
+
+def test_get_splits_no_match_on_date(sqlite_db, seeded_arctic):
+    sql_reader = SQLiteAdjustmentReader(str(sqlite_db))
+    arc_reader = ArcticAdjustmentReader(seeded_arctic)
+
+    dt = pd.Timestamp("2024-01-16", tz="UTC")
+    assets = [1, 2]
+    assert sql_reader.get_splits(assets, dt) == []
+    assert arc_reader.get_splits(assets, dt) == []
+
+
+def test_get_splits_filters_by_assets(sqlite_db, seeded_arctic):
+    sql_reader = SQLiteAdjustmentReader(str(sqlite_db))
+    arc_reader = ArcticAdjustmentReader(seeded_arctic)
+
+    dt = pd.Timestamp("2024-01-15", tz="UTC")
+    assets = [99]  # the split is on sid 1
+    assert sql_reader.get_splits(assets, dt) == []
+    assert arc_reader.get_splits(assets, dt) == []
+
+
+def test_get_splits_empty_assets(sqlite_db, seeded_arctic):
+    sql_reader = SQLiteAdjustmentReader(str(sqlite_db))
+    arc_reader = ArcticAdjustmentReader(seeded_arctic)
+
+    dt = pd.Timestamp("2024-01-15", tz="UTC")
+    assert sql_reader.get_splits([], dt) == []
+    assert arc_reader.get_splits([], dt) == []
+
+
+def test_get_stock_dividends_match(sqlite_db, seeded_arctic):
+    sql_reader = SQLiteAdjustmentReader(str(sqlite_db))
+    arc_reader = ArcticAdjustmentReader(seeded_arctic)
+
+    # seed: sid=2, ex=2024-03-05, pay=2024-03-15. Need start < ex and end > pay.
+    days = pd.DatetimeIndex(
+        [pd.Timestamp("2024-03-01"), pd.Timestamp("2024-03-20")]
+    )
+    sql_out = sql_reader.get_stock_dividends(2, days)
+    arc_out = arc_reader.get_stock_dividends(2, days)
+    assert len(sql_out) == 1
+    assert len(arc_out) == 1
+
+    s, a = sql_out[0], arc_out[0]
+    assert s == a, f"SQLite={s!r}\nArctic={a!r}"
+    assert s["sid"] == 2
+    assert s["payment_sid"] == 99
+    assert s["ratio"] == pytest.approx(0.05)
+    assert s["ex_date"] == pd.Timestamp("2024-03-05")
+    assert s["pay_date"] == pd.Timestamp("2024-03-15")
+
+
+def test_get_stock_dividends_no_match_for_sid(sqlite_db, seeded_arctic):
+    sql_reader = SQLiteAdjustmentReader(str(sqlite_db))
+    arc_reader = ArcticAdjustmentReader(seeded_arctic)
+
+    days = pd.DatetimeIndex(
+        [pd.Timestamp("2024-03-01"), pd.Timestamp("2024-03-20")]
+    )
+    assert sql_reader.get_stock_dividends(9999, days) == []
+    assert arc_reader.get_stock_dividends(9999, days) == []
+
+
+def test_get_stock_dividends_empty_days(sqlite_db, seeded_arctic):
+    sql_reader = SQLiteAdjustmentReader(str(sqlite_db))
+    arc_reader = ArcticAdjustmentReader(seeded_arctic)
+
+    assert sql_reader.get_stock_dividends(2, pd.DatetimeIndex([])) == []
+    assert arc_reader.get_stock_dividends(2, pd.DatetimeIndex([])) == []
+
+
+def test_get_stock_dividends_date_window_excludes(sqlite_db, seeded_arctic):
+    """ex_date > start AND pay_date < end — equality excludes."""
+    sql_reader = SQLiteAdjustmentReader(str(sqlite_db))
+    arc_reader = ArcticAdjustmentReader(seeded_arctic)
+
+    # Window starts exactly on ex_date → should exclude (ex_date > start is False).
+    days = pd.DatetimeIndex(
+        [pd.Timestamp("2024-03-05"), pd.Timestamp("2024-03-20")]
+    )
+    assert sql_reader.get_stock_dividends(2, days) == []
+    assert arc_reader.get_stock_dividends(2, days) == []
