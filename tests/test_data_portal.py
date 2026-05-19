@@ -39,6 +39,9 @@ class DataPortalTestBase(WithDataPortal, WithTradingSessions):
 
     ASSET_FINDER_EQUITY_SIDS = (1, 2, 3)
     DIVIDEND_ASSET_SID = 3
+    SPLIT_ASSET_SID = 1
+    STOCK_DIVIDEND_ASSET_SID = 2
+    STOCK_DIVIDEND_PAYMENT_SID = 3
     START_DATE = pd.Timestamp("2016-08-01")
     END_DATE = pd.Timestamp("2016-08-08")
 
@@ -251,6 +254,44 @@ class DataPortalTestBase(WithDataPortal, WithTradingSessions):
                 "declared_date",
                 "pay_date",
                 "amount",
+                "sid",
+            ],
+        )
+
+    @classmethod
+    def make_splits_data(cls):
+        return pd.DataFrame(
+            [
+                {
+                    "effective_date": cls.trading_days[2].to_datetime64(),
+                    "ratio": 2.0,
+                    "sid": cls.SPLIT_ASSET_SID,
+                }
+            ],
+            columns=["effective_date", "ratio", "sid"],
+        )
+
+    @classmethod
+    def make_stock_dividends_data(cls):
+        return pd.DataFrame(
+            [
+                {
+                    "ex_date": cls.trading_days[2].to_datetime64(),
+                    "record_date": cls.trading_days[2].to_datetime64(),
+                    "declared_date": cls.trading_days[2].to_datetime64(),
+                    "pay_date": cls.trading_days[4].to_datetime64(),
+                    "payment_sid": cls.STOCK_DIVIDEND_PAYMENT_SID,
+                    "ratio": 0.25,
+                    "sid": cls.STOCK_DIVIDEND_ASSET_SID,
+                }
+            ],
+            columns=[
+                "ex_date",
+                "record_date",
+                "declared_date",
+                "pay_date",
+                "payment_sid",
+                "ratio",
                 "sid",
             ],
         )
@@ -486,6 +527,58 @@ class DataPortalTestBase(WithDataPortal, WithTradingSessions):
     def test_get_empty_splits(self):
         splits = self.data_portal.get_splits([], self.trading_days[2])
         assert [] == splits
+
+    def test_get_splits_with_match(self):
+        asset = self.asset_finder.retrieve_asset(self.SPLIT_ASSET_SID)
+        splits = self.data_portal.get_splits([asset], self.trading_days[2])
+        assert len(splits) == 1
+        out_asset, ratio = splits[0]
+        assert out_asset.sid == self.SPLIT_ASSET_SID
+        assert ratio == 2.0
+
+    def test_get_splits_no_match_on_date(self):
+        asset = self.asset_finder.retrieve_asset(self.SPLIT_ASSET_SID)
+        splits = self.data_portal.get_splits([asset], self.trading_days[1])
+        assert [] == splits
+
+    def test_get_splits_filters_by_asset(self):
+        other_asset = self.asset_finder.retrieve_asset(2)
+        splits = self.data_portal.get_splits([other_asset], self.trading_days[2])
+        assert [] == splits
+
+    def test_get_stock_dividends_with_match(self):
+        days = pd.DatetimeIndex(
+            [self.trading_days[1], self.trading_days[5]]
+        )
+        divs = self.data_portal.get_stock_dividends(
+            self.STOCK_DIVIDEND_ASSET_SID, days
+        )
+        assert len(divs) == 1
+        d = divs[0]
+        assert d["sid"] == self.STOCK_DIVIDEND_ASSET_SID
+        assert d["payment_sid"] == self.STOCK_DIVIDEND_PAYMENT_SID
+        assert d["ratio"] == 0.25
+        assert d["ex_date"] == pd.Timestamp(self.trading_days[2].to_datetime64())
+        assert d["pay_date"] == pd.Timestamp(self.trading_days[4].to_datetime64())
+        assert d["declared_date"] == pd.Timestamp(
+            self.trading_days[2].to_datetime64()
+        )
+        assert d["record_date"] == pd.Timestamp(
+            self.trading_days[2].to_datetime64()
+        )
+
+    def test_get_stock_dividends_no_match_for_sid(self):
+        days = pd.DatetimeIndex(
+            [self.trading_days[1], self.trading_days[5]]
+        )
+        divs = self.data_portal.get_stock_dividends(999, days)
+        assert [] == divs
+
+    def test_get_stock_dividends_empty_trading_days(self):
+        divs = self.data_portal.get_stock_dividends(
+            self.STOCK_DIVIDEND_ASSET_SID, pd.DatetimeIndex([])
+        )
+        assert [] == divs
 
     @parameter_space(frequency=HISTORY_FREQUENCIES, field=OHLCV_FIELDS)
     def test_price_rounding(self, frequency, field):
